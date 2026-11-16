@@ -6,7 +6,10 @@
 #include <opencv2/core.hpp>
 
 #include <pthread.h>
+#include <sched.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -53,8 +56,26 @@ constexpr jlong kCapOptions = 1;
 constexpr jlong kCapJpegDecode = 2;
 constexpr jlong kCapStats = 4;
 constexpr jlong kCapLumaFormats = 8;
+constexpr jlong kCapThreadAffinity = 16;
 
 constexpr int kStatsFieldCount = 16;
+
+// When the worker for compressed input starts the decode of the next frame. Set it with
+// PV_GSTREAMER_CAPTURE_DECODE_POLICY (newest, demand, jit).
+//   Newest (default): at once. The newest decoded frame replaces an older one that was not
+//     taken. This gives the lowest frame age.
+//   Demand: after the consumer took the last decoded frame.
+//   JustInTime: as Demand, and if the consumer is slower than the camera, the start waits so
+//     that the decode ends when the consumer is expected to come back. No frame is decoded that
+//     the consumer does not use, which decreases the processor load and the heat. In a
+//     simulation with two cameras the frame rate was the same as with Newest and the latency
+//     was some milliseconds higher.
+enum class DecodePolicy { Newest, Demand, JustInTime };
+
+// Test aid for simulations of a slower processor: after each JPEG frame, decode this percent of
+// the frame again and discard the pixels. 0 (default) = no extra work. Only
+// setTestExtraDecodePercent() changes it.
+std::atomic<int> testExtraDecodePercent {0};
 
 std::once_flag gstInitFlag;
 std::mutex gstCreateMutex;
@@ -140,6 +161,93 @@ int64_t monoNanos() {
   struct timespec ts {};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + static_cast<int64_t>(ts.tv_nsec);
+}
+
+// Limits the calling thread to the CPUs of a bit mask (bit n = CPU n). Returns true if the
+// kernel accepted the mask.
+bool setCurrentThreadCpuMask(uint64_t mask) {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (int cpu = 0; cpu < 64; ++cpu) {
+    if ((mask >> cpu) & 1ULL) {
+      CPU_SET(cpu, &set);
+    }
+  }
+  const pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  return sched_setaffinity(tid, sizeof(set), &set) == 0;
+}
+
+// PV_GSTREAMER_CAPTURE_DECODE_CPUS is a list of CPU numbers, for example "4,5". The decode thread
+// of the first camera uses the first CPU of the list, the second camera the second CPU, and so
+// on. With the other threads of the application on other CPUs (taskset), the time when a camera
+// frame is available does not depend on the load of the vision pipelines.
+std::atomic<int> decodeWorkerCount {0};
+
+[[maybe_unused]] void pinDecodeWorkerFromEnvironment() {
+  const char* raw = std::getenv("PV_GSTREAMER_CAPTURE_DECODE_CPUS");
+  if (raw == nullptr || raw[0] == '\0') {
+    return;
+  }
+
+  std::vector<int> cpus;
+  const char* cursor = raw;
+  while (*cursor != '\0') {
+    char* end = nullptr;
+    const long value = std::strtol(cursor, &end, 10);
+    if (end == cursor) {
+      ++cursor;
+      continue;
+    }
+    if (value >= 0 && value < 64) {
+      cpus.push_back(static_cast<int>(value));
+    }
+    cursor = end;
+  }
+  if (cpus.empty()) {
+    return;
+  }
+
+  const int index = decodeWorkerCount.fetch_add(1);
+  const int cpu = cpus[static_cast<size_t>(index) % cpus.size()];
+  if (!setCurrentThreadCpuMask(1ULL << cpu)) {
+    std::cerr << "[GStreamer Capture JNI] Could not put the decode thread on CPU " << cpu << "\n";
+  }
+}
+
+// PV_GSTREAMER_CAPTURE_RT_PRIORITY=N (1 to 50) gives the capture threads the real-time policy
+// SCHED_FIFO with priority N: the GStreamer thread that takes the frames from the camera, and the
+// JPEG decode thread. These threads then get a CPU immediately when a frame arrives, also when the
+// vision pipelines use all CPUs. So the time when a frame is available does not depend on the
+// pipeline load. The threads do a limited amount of work for each frame and then wait, so they
+// cannot stop the other threads. The process needs the permission for real-time priority (root or
+// CAP_SYS_NICE). If the kernel refuses, the threads keep the normal policy.
+int realtimePriorityFromEnvironment() {
+  static const int priority = [] {
+    const char* raw = std::getenv("PV_GSTREAMER_CAPTURE_RT_PRIORITY");
+    if (raw == nullptr || raw[0] == '\0') {
+      return 0;
+    }
+    const long value = std::strtol(raw, nullptr, 10);
+    return static_cast<int>(std::max(0L, std::min(50L, value)));
+  }();
+  return priority;
+}
+
+void applyRealtimePriorityToCurrentThread(const char* threadName) {
+  const int priority = realtimePriorityFromEnvironment();
+  if (priority <= 0) {
+    return;
+  }
+  sched_param param {};
+  param.sched_priority = priority;
+  const int error = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+  if (error != 0) {
+    static std::atomic<bool> reported {false};
+    if (!reported.exchange(true)) {
+      std::cerr << "[GStreamer Capture JNI] Could not set real-time priority " << priority
+                << " for the " << threadName << " thread: " << std::strerror(error) << "\n";
+    }
+  }
 }
 
 jlong steadyNowNanos() {
@@ -328,7 +436,7 @@ struct Capture {
   int outputMode = kOutputAuto;
   bool wrapMappedBuffer = false;
   bool strictMlPts = false;
-  bool decodeOnDemand = false;
+  DecodePolicy decodePolicy = DecodePolicy::Newest;
   bool tolerateExtraneousJpegBytes = false;
   int strictMlMaxPulls = 4;
   int strictCpuMaxDrops = 2;
@@ -355,6 +463,17 @@ struct Capture {
   std::condition_variable slotEmptied;
   FrameHolder* latest = nullptr;
   bool workerEnded = false;
+
+  // Timing data for the JustInTime policy. slotMutex guards these fields.
+  bool consumerWaiting = false;
+  bool lastTakeWaited = true;
+  int64_t lastTakeNanos = 0;
+  int64_t takeIntervalNanos[4] = {};
+  int takeIntervalCount = 0;
+  int takeIntervalNext = 0;
+  std::atomic<int64_t> decodeNanosAverage {0};
+  std::atomic<int64_t> sourcePeriodNanosAverage {0};
+  int64_t lastSourceNanos = 0;
   int consecutiveExtraneousOnly = 0;
   bool unsupportedFormatLogged = false;
 };
@@ -465,6 +584,13 @@ GstPadProbeReturn sourceBufferProbe(GstPad*, GstPadProbeInfo* info, gpointer use
     return GST_PAD_PROBE_OK;
   }
 
+  // This function runs on the GStreamer thread that takes the frames from the camera.
+  static thread_local bool priorityApplied = false;
+  if (!priorityApplied) {
+    priorityApplied = true;
+    applyRealtimePriorityToCurrentThread("camera source");
+  }
+
   const int64_t now = monoNanos();
   int64_t deviceDelay = 0;
 
@@ -499,30 +625,53 @@ GstPadProbeReturn sourceBufferProbe(GstPad*, GstPadProbeInfo* info, gpointer use
       buffer, capture->captureTimeCaps, static_cast<GstClockTime>(now - deviceDelay),
       GST_CLOCK_TIME_NONE);
 
+  // Camera frame period, for the JustInTime decode policy. Only this thread writes these fields.
+  if (capture->lastSourceNanos > 0) {
+    const int64_t period = now - capture->lastSourceNanos;
+    if (period > 0 && period < 1000000000LL) {
+      const int64_t previous = capture->sourcePeriodNanosAverage.load(std::memory_order_relaxed);
+      capture->sourcePeriodNanosAverage.store(
+          previous == 0 ? period : (previous * 7 + period) / 8, std::memory_order_relaxed);
+    }
+  }
+  capture->lastSourceNanos = now;
+
   capture->stats.sourceBuffers.fetch_add(1, std::memory_order_relaxed);
   capture->stats.deviceDelayNanosSum.fetch_add(deviceDelay, std::memory_order_relaxed);
   return GST_PAD_PROBE_OK;
 }
 
+// Installs the capture-time probe. The probe is on the src pad of the element with the name
+// "pvcapturetime", if the pipeline has one. If not, it is on the src pad of the first source
+// element (the camera). The name lets a pipeline define the point where a frame "arrives".
 void installSourceProbe(Capture* capture) {
-  GstIterator* sources = gst_bin_iterate_sources(GST_BIN(capture->pipeline));
-  if (sources == nullptr) {
-    return;
+  GstPad* pad = nullptr;
+
+  GstElement* named = gst_bin_get_by_name(GST_BIN(capture->pipeline), "pvcapturetime");
+  if (named != nullptr) {
+    pad = gst_element_get_static_pad(named, "src");
+    gst_object_unref(named);
   }
 
-  GValue item = G_VALUE_INIT;
-  if (gst_iterator_next(sources, &item) == GST_ITERATOR_OK) {
-    GstElement* source = GST_ELEMENT(g_value_get_object(&item));
-    GstPad* pad = source != nullptr ? gst_element_get_static_pad(source, "src") : nullptr;
-    if (pad != nullptr) {
-      capture->sourcePad = pad;
-      capture->sourceProbeId =
-          gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, sourceBufferProbe, capture, nullptr);
+  if (pad == nullptr) {
+    GstIterator* sources = gst_bin_iterate_sources(GST_BIN(capture->pipeline));
+    if (sources != nullptr) {
+      GValue item = G_VALUE_INIT;
+      if (gst_iterator_next(sources, &item) == GST_ITERATOR_OK) {
+        GstElement* source = GST_ELEMENT(g_value_get_object(&item));
+        pad = source != nullptr ? gst_element_get_static_pad(source, "src") : nullptr;
+        g_value_reset(&item);
+      }
+      g_value_unset(&item);
+      gst_iterator_free(sources);
     }
-    g_value_reset(&item);
   }
-  g_value_unset(&item);
-  gst_iterator_free(sources);
+
+  if (pad != nullptr) {
+    capture->sourcePad = pad;
+    capture->sourceProbeId =
+        gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, sourceBufferProbe, capture, nullptr);
+  }
 }
 
 int64_t captureTimeFromBuffer(Capture* capture, GstBuffer* buffer) {
@@ -1089,7 +1238,7 @@ enum class JpegResult { Ok, Error, Damaged };
 // chroma components. The luma samples are the same samples that a full decode gives.
 JpegResult decodeJpeg(
     JpegDecoder* decoder, BufferPool* pool, const uint8_t* data, size_t size, bool wantGray,
-    PooledBuffer* out, int* outWidth, int* outHeight, int* outChannels) {
+    PooledBuffer* out, int* outWidth, int* outHeight, int* outChannels, int rowPercent = 100) {
   // Volatile: these values change after setjmp() and are read after longjmp().
   PooledBuffer volatile buffer {};
   JSAMPROW rows[16];
@@ -1157,8 +1306,14 @@ JpegResult decodeJpeg(
     return JpegResult::Error;
   }
 
-  while (cinfo->output_scanline < cinfo->output_height) {
-    const int remaining = static_cast<int>(cinfo->output_height - cinfo->output_scanline);
+  // rowPercent < 100 is only for the test aid: decode a part of the rows and stop.
+  const JDIMENSION lastRow =
+      rowPercent >= 100
+          ? cinfo->output_height
+          : static_cast<JDIMENSION>(
+                static_cast<uint64_t>(cinfo->output_height) * static_cast<uint64_t>(rowPercent) / 100);
+  while (cinfo->output_scanline < lastRow) {
+    const int remaining = static_cast<int>(lastRow - cinfo->output_scanline);
     const int count = std::min(16, remaining);
     for (int i = 0; i < count; ++i) {
       rows[i] = buffer.data +
@@ -1166,7 +1321,11 @@ JpegResult decodeJpeg(
     }
     jpeg_read_scanlines(cinfo, rows, static_cast<JDIMENSION>(count));
   }
-  jpeg_finish_decompress(cinfo);
+  if (lastRow < cinfo->output_height) {
+    jpeg_abort_decompress(cinfo);
+  } else {
+    jpeg_finish_decompress(cinfo);
+  }
 
   if (swapRedBlue) {
     uint8_t* p = buffer.data;
@@ -1209,6 +1368,20 @@ FrameHolder* frameFromJpegSample(Capture* capture, JpegDecoder* decoder, GstSamp
   const bool extraneousOnly =
       result == JpegResult::Damaged && !decoder->error.dataDamaged &&
       decoder->error.extraneousBytes;
+
+  // Test aid: extra decode work to simulate a slower processor. The pixels are discarded.
+  for (int extra = testExtraDecodePercent.load(std::memory_order_relaxed); extra > 0;
+       extra -= 100) {
+    PooledBuffer scratch {};
+    int w = 0;
+    int h = 0;
+    int c = 0;
+    if (decodeJpeg(
+            decoder, capture->pool.get(), map.data, map.size, capture->outputMode == kOutputGray,
+            &scratch, &w, &h, &c, std::min(100, extra)) != JpegResult::Error) {
+      capture->pool->release(scratch);
+    }
+  }
   gst_buffer_unmap(buffer, &map);
   gst_sample_unref(sample);
 
@@ -1252,6 +1425,10 @@ FrameHolder* frameFromJpegSample(Capture* capture, JpegDecoder* decoder, GstSamp
   const int64_t decodeNanos = monoNanos() - decodeStart;
   capture->stats.convertNanosSum.fetch_add(decodeNanos, std::memory_order_relaxed);
   atomicMax(capture->stats.convertNanosMax, decodeNanos);
+  const int64_t previousAverage = capture->decodeNanosAverage.load(std::memory_order_relaxed);
+  capture->decodeNanosAverage.store(
+      previousAverage == 0 ? decodeNanos : (previousAverage * 7 + decodeNanos) / 8,
+      std::memory_order_relaxed);
   return holder.release();
 }
 
@@ -1272,15 +1449,53 @@ bool capsAreJpeg(GstCaps* caps) {
 // one frame, and the frame age has a fixed upper limit.
 void workerLoop(Capture* capture) {
   pthread_setname_np(pthread_self(), "pv-jpeg-decode");
+  pinDecodeWorkerFromEnvironment();
+  applyRealtimePriorityToCurrentThread("JPEG decode");
   JpegDecoder decoder;
 
   while (!capture->workerStop.load()) {
-    if (capture->decodeOnDemand) {
-      // Lower CPU load: decode the next frame only after the consumer took the last one.
+    if (capture->decodePolicy != DecodePolicy::Newest) {
       std::unique_lock<std::mutex> lock(capture->slotMutex);
-      capture->slotEmptied.wait(lock, [capture]() {
+      const auto stopOrEmpty = [capture]() {
         return capture->latest == nullptr || capture->workerStop.load();
-      });
+      };
+
+      if (capture->decodePolicy == DecodePolicy::Demand) {
+        capture->slotEmptied.wait(lock, stopOrEmpty);
+      } else {
+        // JustInTime. Wait until the consumer took the last frame. If the consumer does not
+        // come for one camera frame period, decode a newer frame, so the frame in the slot does
+        // not become old.
+        int64_t framePeriod = capture->sourcePeriodNanosAverage.load(std::memory_order_relaxed);
+        if (framePeriod <= 0) {
+          framePeriod = 20000000LL;
+        }
+        capture->slotEmptied.wait_for(lock, std::chrono::nanoseconds(framePeriod), stopOrEmpty);
+
+        // The consumer took the frame, and it did not have to wait for that frame. Thus the
+        // consumer is slower than the camera. Start the next decode so that it ends a short time
+        // before the consumer is expected to come back. Use the shortest of the last consumer
+        // periods: a start that is too early only makes the frame a little older, but a start
+        // that is too late makes the consumer wait.
+        if (capture->latest == nullptr && !capture->lastTakeWaited && !capture->consumerWaiting &&
+            capture->takeIntervalCount >= 2 && !capture->workerStop.load()) {
+          int64_t consumerPeriod = capture->takeIntervalNanos[0];
+          for (int i = 1; i < capture->takeIntervalCount; ++i) {
+            consumerPeriod = std::min(consumerPeriod, capture->takeIntervalNanos[i]);
+          }
+          const int64_t decodeTime = capture->decodeNanosAverage.load(std::memory_order_relaxed);
+          const int64_t margin = 500000LL + decodeTime / 8;
+          const int64_t startAt = capture->lastTakeNanos + consumerPeriod - decodeTime - margin;
+          const int64_t wait = startAt - monoNanos();
+          if (wait > 0) {
+            // If the consumer comes back before the start time, it sets consumerWaiting and
+            // the decode starts immediately.
+            capture->slotEmptied.wait_for(lock, std::chrono::nanoseconds(wait), [capture]() {
+              return capture->consumerWaiting || capture->workerStop.load();
+            });
+          }
+        }
+      }
       if (capture->workerStop.load()) {
         break;
       }
@@ -1423,7 +1638,14 @@ jlong createCapture(const std::string& pipelineText, int outputMode) {
   capture->strictMlMaxPulls = std::max(1, envInt("PV_GSTREAMER_CAPTURE_STRICT_ML_MAX_PULLS", 4));
   capture->strictCpuMaxDrops = std::max(0, envInt("PV_GSTREAMER_CAPTURE_STRICT_CPU_MAX_DROPS", 2));
   capture->timingLogEvery = envInt("PV_GSTREAMER_CAPTURE_TIMING_LOG_EVERY", 0);
-  capture->decodeOnDemand = envLower("PV_GSTREAMER_CAPTURE_DECODE_POLICY") == "demand";
+  const std::string decodePolicy = envLower("PV_GSTREAMER_CAPTURE_DECODE_POLICY");
+  if (decodePolicy == "jit" || decodePolicy == "justintime" || decodePolicy == "just-in-time") {
+    capture->decodePolicy = DecodePolicy::JustInTime;
+  } else if (decodePolicy == "demand") {
+    capture->decodePolicy = DecodePolicy::Demand;
+  } else {
+    capture->decodePolicy = DecodePolicy::Newest;
+  }
   capture->tolerateExtraneousJpegBytes =
       envFlagEnabled("PV_GSTREAMER_CAPTURE_ALLOW_JPEG_EXTRA_BYTES");
   capture->captureTimeCaps = gst_caps_new_empty_simple("timestamp/x-photonvision-capture-mono");
@@ -1495,11 +1717,23 @@ Java_org_photonvision_gstreamer_GStreamerCaptureJNI_createWithOptions(
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_photonvision_gstreamer_GStreamerCaptureJNI_getCapabilities(JNIEnv*, jclass) {
-  jlong capabilities = kCapOptions | kCapStats | kCapLumaFormats;
+  jlong capabilities = kCapOptions | kCapStats | kCapLumaFormats | kCapThreadAffinity;
 #ifdef PV_HAVE_LIBJPEG
   capabilities |= kCapJpegDecode;
 #endif
   return capabilities;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_photonvision_gstreamer_GStreamerCaptureJNI_setTestExtraDecodePercent(
+    JNIEnv*, jclass, jint percent) {
+  testExtraDecodePercent.store(std::max(0, static_cast<int>(percent)));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_photonvision_gstreamer_GStreamerCaptureJNI_setCurrentThreadCpuMask(
+    JNIEnv*, jclass, jlong cpuMask) {
+  return setCurrentThreadCpuMask(static_cast<uint64_t>(cpuMask)) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1559,13 +1793,36 @@ Java_org_photonvision_gstreamer_GStreamerCaptureJNI_grab(
     {
       std::unique_lock<std::mutex> lock(capture->slotMutex);
       const auto ready = [capture]() { return capture->latest != nullptr || capture->workerEnded; };
+      const bool mustWait = !ready();
+      if (mustWait) {
+        // Tell the worker that the consumer is here, so a delayed decode starts now.
+        capture->consumerWaiting = true;
+        capture->slotEmptied.notify_one();
+      }
       if (timeoutMillis < 0) {
         capture->slotFilled.wait(lock, ready);
       } else {
         capture->slotFilled.wait_for(lock, std::chrono::milliseconds(timeoutMillis), ready);
       }
+      capture->consumerWaiting = false;
       holder = capture->latest;
       capture->latest = nullptr;
+      if (holder != nullptr) {
+        const int64_t now = monoNanos();
+        if (capture->lastTakeNanos > 0) {
+          const int64_t interval = now - capture->lastTakeNanos;
+          if (interval > 0 && interval < 1000000000LL) {
+            capture->takeIntervalNanos[capture->takeIntervalNext] = interval;
+            capture->takeIntervalNext = (capture->takeIntervalNext + 1) % 4;
+            capture->takeIntervalCount = std::min(4, capture->takeIntervalCount + 1);
+          } else {
+            capture->takeIntervalCount = 0;
+            capture->takeIntervalNext = 0;
+          }
+        }
+        capture->lastTakeNanos = now;
+        capture->lastTakeWaited = mustWait;
+      }
     }
     capture->slotEmptied.notify_one();
     if (holder == nullptr) {

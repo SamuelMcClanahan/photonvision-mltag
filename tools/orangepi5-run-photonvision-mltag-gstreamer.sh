@@ -68,9 +68,28 @@ export PV_USB_GSTREAMER_HW_JPEG_DECODER="${PV_USB_GSTREAMER_HW_JPEG_DECODER:-}"
 # than the camera. Set this to 1 to process one frame at a time.
 export PV_MLTAG_INFERENCE_LANES="${PV_MLTAG_INFERENCE_LANES:-2}"
 
+# Time reserve of the overlap, as a part of one camera frame period. With 0.3
+# the result of a frame is ready before the vision thread needs it, so the time
+# between results stays regular. With -0.25 the latency can be one camera frame
+# period less (about 17 ms at 60 FPS), but then a part of the results is late.
+export PV_MLTAG_OVERLAP_RESERVE="${PV_MLTAG_OVERLAP_RESERVE:-0.3}"
+
 # NPU core selection: -1 = the runtime selects a core that is not busy.
 # 0, 1, 2 = one core. 10 = cores 0 and 1 together. 210 = all three cores together.
 export PV_RKNN_CORE_MASK="${PV_RKNN_CORE_MASK:--1}"
+
+# OpenCV divides each small image operation between all CPUs. In this pipeline
+# that only adds thread wake-ups: with two cameras the simulation gave about
+# 47 FPS without this setting and about 56 FPS with it. The results are equal.
+export PV_OPENCV_THREADS="${PV_OPENCV_THREADS:-1}"
+
+# Real-time priority (SCHED_FIFO) for the capture threads: the thread that takes
+# the frames from the camera and the JPEG decode thread. They get a CPU
+# immediately when a frame arrives, also when the vision pipelines use all
+# CPUs. In the two-camera simulation this increased the frame rate that 99% of
+# the frames keep from about 41 FPS to about 46 FPS. It needs root or
+# CAP_SYS_NICE. Set it to 0 to use the normal thread policy.
+export PV_GSTREAMER_CAPTURE_RT_PRIORITY="${PV_GSTREAMER_CAPTURE_RT_PRIORITY:-10}"
 
 # Frame-flow diagnosis. Set this to 600 to print one line for each 600 frames:
 # camera FPS, decoded FPS, delivered FPS, dropped frames, frame age, decode time.

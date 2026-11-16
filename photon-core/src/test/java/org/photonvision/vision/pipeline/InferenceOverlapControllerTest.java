@@ -30,7 +30,10 @@ import org.photonvision.vision.pipeline.InferenceOverlapController.Action;
 public class InferenceOverlapControllerTest {
     private static final long MS = 1_000_000L;
 
-    /** A simulated vision loop. It models a camera that gives the newest frame. */
+    /**
+     * A simulated pipeline: a camera that gives the newest frame, inference lanes, and one work
+     * thread that does the work after the inference for one frame after the other.
+     */
     private static class Simulation {
         final InferenceOverlapController controller;
         final int lanes;
@@ -41,9 +44,10 @@ public class InferenceOverlapControllerTest {
 
         long now = 1_000 * MS;
         long lastFrameIndex = -1;
-        // Completion times of the frames that are in inference, oldest first.
+        // Times when the results of the frames in work are ready, oldest first.
         final java.util.ArrayDeque<Long> pending = new java.util.ArrayDeque<>();
         final long[] laneFreeAt;
+        long workThreadFreeAt = 0;
         double inferenceAverage = 0;
         int inferenceSamples = 0;
 
@@ -51,9 +55,19 @@ public class InferenceOverlapControllerTest {
         int deferred = 0;
         int skipped = 0;
         int ownFrameResults = 0;
+        long waitedForResults = 0;
 
         Simulation(int lanes, long cameraPeriod, long inference, long postInference) {
-            this.controller = new InferenceOverlapController(lanes);
+            this(
+                    lanes,
+                    cameraPeriod,
+                    inference,
+                    postInference,
+                    InferenceOverlapController.DEFAULT_RESERVE);
+        }
+
+        Simulation(int lanes, long cameraPeriod, long inference, long postInference, double reserve) {
+            this.controller = new InferenceOverlapController(lanes, reserve);
             this.lanes = lanes;
             this.cameraPeriod = cameraPeriod;
             this.inference = inference;
@@ -61,16 +75,19 @@ public class InferenceOverlapControllerTest {
             this.laneFreeAt = new long[lanes];
         }
 
-        private long startInference() {
+        /** Starts a frame and returns the time when its result is ready. */
+        private long startFrame() {
             int lane = 0;
             for (int i = 1; i < lanes; i++) {
                 if (laneFreeAt[i] < laneFreeAt[lane]) {
                     lane = i;
                 }
             }
-            long done = Math.max(now, laneFreeAt[lane]) + inference;
-            laneFreeAt[lane] = done;
-            return done;
+            long inferenceDone = Math.max(now, laneFreeAt[lane]) + inference;
+            laneFreeAt[lane] = inferenceDone;
+            long ready = Math.max(inferenceDone, workThreadFreeAt) + postInference;
+            workThreadFreeAt = ready;
+            return ready;
         }
 
         void step() {
@@ -80,31 +97,32 @@ public class InferenceOverlapControllerTest {
             now = Math.max(now, frameTime) + loopOverhead;
             lastFrameIndex = frameIndex;
 
+            int pendingBefore = pending.size();
             Action action =
-                    controller.onFrame(now, frameTime, pending.size(), inferenceAverage, inferenceSamples);
-            boolean ownFrame = false;
+                    controller.onFrame(now, frameTime, pendingBefore, inferenceAverage, inferenceSamples);
             if (action == Action.SKIP_INPUT) {
-                assertFalse(pending.isEmpty(), "SKIP_INPUT needs a frame that is in inference");
+                assertFalse(pending.isEmpty(), "SKIP_INPUT needs a frame that is in work");
                 skipped++;
             } else {
-                pending.addLast(startInference());
+                pending.addLast(startFrame());
                 if (action == Action.DEFER) {
-                    assertTrue(pending.size() <= lanes - 1 + 1);
+                    assertTrue(pending.size() <= InferenceOverlapController.MAX_DEPTH);
                     deferred++;
                     controller.onCallEnd(now, -1);
                     return;
                 }
-                ownFrame = pending.size() == 1;
             }
 
-            long done = pending.removeFirst();
-            now = Math.max(now, done);
+            long ready = pending.removeFirst();
+            if (ready > now) {
+                waitedForResults += ready - now;
+                now = ready;
+            }
             inferenceAverage =
                     inferenceSamples == 0 ? inference : inferenceAverage * 0.9 + inference * 0.1;
             inferenceSamples++;
-            now += postInference;
             results++;
-            if (ownFrame) {
+            if (pendingBefore == 0 && action == Action.COMPLETE_OLDEST) {
                 ownFrameResults++;
             }
             controller.onCallEnd(now, postInference);
@@ -143,27 +161,69 @@ public class InferenceOverlapControllerTest {
 
     @Test
     public void slowInferenceStartsOverlapAndReachesTheCameraRate() {
-        // RK3588: about 24 ms inference on one NPU core, 60 FPS camera.
-        var serial = new Simulation(1, 16_666_667L, 24 * MS, 3 * MS);
+        // RK3588: about 22 ms inference on one NPU core and 8 ms tag decode, 60 FPS camera.
+        var serial = new Simulation(1, 16_666_667L, 22 * MS, 8 * MS);
         double serialFps = serial.run(600);
-        assertTrue(serialFps < 40, "One lane is limited by the inference time: " + serialFps);
+        assertTrue(serialFps < 35, "One lane is limited by the work for one frame: " + serialFps);
 
-        var sim = new Simulation(2, 16_666_667L, 24 * MS, 3 * MS);
-        sim.run(60);
-        assertTrue(sim.controller.isOverlapActive(), "Overlap must start in less than 60 frames");
+        var sim = new Simulation(2, 16_666_667L, 22 * MS, 8 * MS);
+        sim.run(120);
+        assertTrue(sim.controller.isOverlapActive(), "Overlap must start in less than 120 frames");
+        // 30 ms of work for a frame. Two frames in work give 33.3 ms. That is less than the
+        // reserve of 0.3 frame periods (5 ms) above the work time, so three frames are in work.
+        assertEquals(3, sim.controller.getDepth());
+        long waitedBefore = sim.waitedForResults;
         double fps = sim.run(600);
         assertEquals(60.0, fps, 0.5, "Two lanes must keep the camera rate");
         assertEquals(0, sim.skipped);
-        assertEquals(1, sim.deferred, "Only the first overlap call gives no result");
+        assertEquals(3, sim.deferred, "Only the calls that increase the depth give no result");
+        assertEquals(
+                0, sim.waitedForResults - waitedBefore, "The vision thread must not wait for a result");
     }
 
     @Test
-    public void twoCamerasAtFiftyFramesEachNeedThreeLanesWorthOfNpu() {
-        // One camera with 2 lanes at 50 FPS and a 30 ms model also keeps its rate.
+    public void workWithSufficientReserveUsesTwoFramesInWork() {
+        // 26 ms of work for a frame. Two frames in work give 33.3 ms: the reserve is 7 ms.
+        var sim = new Simulation(2, 16_666_667L, 22 * MS, 4 * MS);
+        sim.run(120);
+        assertTrue(sim.controller.isOverlapActive());
+        assertEquals(2, sim.controller.getDepth());
+        long waitedBefore = sim.waitedForResults;
+        double fps = sim.run(600);
+        assertEquals(60.0, fps, 0.5);
+        assertEquals(2, sim.deferred);
+        assertEquals(0, sim.waitedForResults - waitedBefore);
+    }
+
+    @Test
+    public void smallerReserveKeepsFewerFramesInWork() {
+        // The same 30 ms of work with a reserve of -0.25: two frames in work (less latency).
+        var sim = new Simulation(2, 16_666_667L, 22 * MS, 8 * MS, -0.25);
+        sim.run(120);
+        assertTrue(sim.controller.isOverlapActive());
+        assertEquals(2, sim.controller.getDepth());
+        double fps = sim.run(600);
+        assertEquals(60.0, fps, 0.5);
+        assertEquals(2, sim.deferred);
+    }
+
+    @Test
+    public void oneCameraAtFiftyFramesWithASlowerModelKeepsItsRate() {
         var sim = new Simulation(2, 20 * MS, 30 * MS, 3 * MS);
-        sim.run(60);
+        sim.run(120);
         double fps = sim.run(500);
         assertEquals(50.0, fps, 0.5);
+    }
+
+    @Test
+    public void depthDoesNotIncreaseWhenTheWorkThreadIsTheLimit() {
+        // 20 ms of tag decode for each frame is more than the 16.7 ms frame period. More frames
+        // in work cannot help, so the depth must stay small (more depth only adds latency).
+        var sim = new Simulation(2, 16_666_667L, 22 * MS, 20 * MS);
+        sim.run(600);
+        assertTrue(sim.controller.getDepth() <= 3, "Depth: " + sim.controller.getDepth());
+        double fps = sim.run(600);
+        assertEquals(50.0, fps, 1.0, "The rate is the rate of the work thread");
     }
 
     @Test
@@ -176,14 +236,17 @@ public class InferenceOverlapControllerTest {
         sim.inference = 5 * MS;
         sim.run(400);
         assertFalse(sim.controller.isOverlapActive(), "Serial mode gives the lowest latency");
-        assertEquals(1, sim.skipped, "One camera frame is skipped to go back to serial mode");
+        assertTrue(
+                sim.skipped >= 1 && sim.skipped <= 2,
+                "One camera frame is skipped for each frame in work to go back to serial mode");
+        int skippedAfterChange = sim.skipped;
 
         int ownBefore = sim.ownFrameResults;
         int deferredBefore = sim.deferred;
         double fps = sim.run(600);
         assertEquals(600, sim.ownFrameResults - ownBefore);
         assertEquals(deferredBefore, sim.deferred);
-        assertEquals(1, sim.skipped, "The modes must not change again and again");
+        assertEquals(skippedAfterChange, sim.skipped, "The modes must not change again and again");
         assertEquals(60.0, fps, 0.5);
     }
 
@@ -194,8 +257,8 @@ public class InferenceOverlapControllerTest {
         for (long decode : new long[] {5_200_000L, 5_800_000L, 6_000_000L, 6_500_000L, 7_000_000L}) {
             var sim = new Simulation(2, 16_666_667L, 9 * MS, decode);
             sim.run(3000);
-            assertTrue(sim.skipped <= 1, "At most one frame can be skipped: " + sim.skipped);
-            assertTrue(sim.deferred <= 1, "The overlap can start one time only: " + sim.deferred);
+            assertTrue(sim.skipped <= 2, "The overlap can stop one time only: " + sim.skipped);
+            assertTrue(sim.deferred <= 2, "The overlap can start one time only: " + sim.deferred);
             double fps = sim.run(600);
             assertEquals(60.0, fps, 0.5);
         }
@@ -222,7 +285,7 @@ public class InferenceOverlapControllerTest {
         // The camera mode changes to 60 FPS. Now one inference is longer than the frame period.
         sim.cameraPeriod = 16_666_667L;
         sim.lastFrameIndex = sim.now / sim.cameraPeriod;
-        sim.run(200);
+        sim.run(300);
         assertTrue(sim.controller.isOverlapActive());
         double fps = sim.run(600);
         assertEquals(60.0, fps, 0.5);
@@ -230,10 +293,12 @@ public class InferenceOverlapControllerTest {
 
     @Test
     public void threeLanesServeAVerySlowModel() {
-        // 45 ms inference needs three lanes for a 60 FPS camera.
-        var sim = new Simulation(3, 16_666_667L, 45 * MS, 2 * MS);
-        sim.run(100);
+        // 40 ms inference needs three lanes for a 60 FPS camera. 42 ms of work for a frame is less
+        // than three frame periods (50 ms) minus the reserve (5 ms).
+        var sim = new Simulation(3, 16_666_667L, 40 * MS, 2 * MS);
+        sim.run(200);
         assertTrue(sim.controller.isOverlapActive());
+        assertEquals(3, sim.controller.getDepth());
         double fps = sim.run(600);
         assertEquals(60.0, fps, 0.5);
     }

@@ -70,9 +70,10 @@ public class AprilTagMLHybridPipe
     private final double maxRawRoiAreaFraction =
             EnvUtils.decimal("PV_MLTAG_MAX_RAW_ROI_AREA_FRAC", 0.0);
 
-    // Moving average of the inference time of one frame. Written by complete() on the vision thread.
-    private double inferenceNanosAverage = 0;
-    private int inferenceSamples = 0;
+    // Moving average of the inference time of one frame. complete() writes it. One thread calls
+    // complete() (the work thread of the pipeline), and the vision thread reads the values.
+    private volatile double inferenceNanosAverage = 0;
+    private volatile int inferenceSamples = 0;
 
     public static class Params {
         public final AprilTagROIDetectionPipe.AprilTagROIDetectionParams detectionParams;
@@ -206,11 +207,12 @@ public class AprilTagMLHybridPipe
     public CompletedDetection complete(PendingDetection pending)
             throws InterruptedException, ExecutionException {
         LaneOutput lane = pending.future.get();
+        int samples = inferenceSamples;
         inferenceNanosAverage =
-                inferenceSamples == 0
+                samples == 0
                         ? lane.nanosElapsed()
                         : inferenceNanosAverage * 0.9 + lane.nanosElapsed() * 0.1;
-        inferenceSamples++;
+        inferenceSamples = samples + 1;
 
         long decodeStart = System.nanoTime();
         MLDetectionResult result = decodeStage(pending.frame, lane.rois());

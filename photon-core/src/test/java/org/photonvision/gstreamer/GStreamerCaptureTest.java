@@ -516,7 +516,25 @@ public class GStreamerCaptureTest {
             assertNotNull(stats);
             assertEquals(30, stats.framesDelivered());
             assertTrue(stats.sourceBuffers() > 60, "The source must run at its own rate");
-            assertTrue(stats.framesReplaced() > 0, "Old decoded frames must be replaced");
+            // The consumer used 30 of about 120 camera frames. The other frames must be dropped:
+            // after the decode (newest policy, the default) or before it (the other policies).
+            long unusedCameraFrames = stats.sourceBuffers() - stats.framesDelivered();
+            long droppedBeforeDecode = stats.sourceBuffers() - stats.samplesPulled();
+            assertTrue(unusedCameraFrames > 60);
+            assertTrue(
+                    droppedBeforeDecode + stats.framesReplaced() >= unusedCameraFrames - 3,
+                    "Camera frames that are not used must be dropped, not collected");
+            String policy = System.getenv("PV_GSTREAMER_CAPTURE_DECODE_POLICY");
+            if ("jit".equals(policy)) {
+                // Just-in-time: after the first frames (the library first measures the consumer
+                // period), no frame is decoded that the consumer does not take. The newest policy
+                // decodes about 120 frames here.
+                assertTrue(
+                        stats.framesProduced() <= stats.framesDelivered() + 15,
+                        "Decoded " + stats.framesProduced() + " frames for 30 deliveries");
+            } else if (policy == null || policy.isBlank() || "newest".equals(policy)) {
+                assertTrue(stats.framesReplaced() > 0, "Old decoded frames must be replaced");
+            }
             assertEquals(0, stats.captureTimeMissing());
             assertEquals(0, stats.corruptFrames());
         }

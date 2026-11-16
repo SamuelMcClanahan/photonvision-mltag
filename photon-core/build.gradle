@@ -50,13 +50,22 @@ if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac")) {
             }
 
             fileTree(outputDir).files.findAll { it.isFile() }.each { nativeFile ->
-                def stripResult = runCommand(["strip", "-x", "-S", nativeFile.absolutePath], true)
+                def stripResult = runCommand([
+                    "strip",
+                    "-x",
+                    "-S",
+                    nativeFile.absolutePath
+                ], true)
 
                 if (stripResult.exitValue != 0) {
                     fixupTask.logger.info("Continuing after strip failed for ${nativeFile.name}")
                 }
 
-                def otoolResult = runCommand(["otool", "-L", nativeFile.absolutePath], true)
+                def otoolResult = runCommand([
+                    "otool",
+                    "-L",
+                    nativeFile.absolutePath
+                ], true)
 
                 if (otoolResult.exitValue != 0) {
                     fixupTask.logger.info("Skipping install-name and codesign fixups for ${nativeFile.name}")
@@ -81,13 +90,22 @@ if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac")) {
                             ? dependency.substring("@rpath/".length())
                             : dependency
 
-                    runCommand(["install_name_tool", "-change",
-                                dependency,
-                                "@loader_path/${loaderPathDependency}",
-                                nativeFile.absolutePath], false)
+                    runCommand([
+                        "install_name_tool",
+                        "-change",
+                        dependency,
+                        "@loader_path/${loaderPathDependency}",
+                        nativeFile.absolutePath
+                    ], false)
                 }
 
-                runCommand(["codesign", "--force", "--sign", "-", nativeFile.absolutePath], false)
+                runCommand([
+                    "codesign",
+                    "--force",
+                    "--sign",
+                    "-",
+                    nativeFile.absolutePath
+                ], false)
             }
         }
     }
@@ -97,6 +115,7 @@ nativeTasks.addToSourceSetResources(sourceSets.main)
 
 def photonTargetingNativePlatformPaths = [
     linuxarm64: [resourcePath: "linux/arm64", sharedExt: "so"],
+    "linuxx86-64": [resourcePath: "linux/x86-64", sharedExt: "so"],
     osxuniversal: [resourcePath: "osx/universal", sharedExt: "dylib"],
 ]
 

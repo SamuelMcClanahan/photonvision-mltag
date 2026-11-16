@@ -42,6 +42,9 @@ public final class GStreamerCaptureJNI {
     /** Planar YUV, packed YUV 4:2:2 and GRAY8 appsink buffers give a 1-channel image. */
     public static final long CAP_LUMA_FORMATS = 8;
 
+    /** {@link #setCurrentThreadCpuMask(long)} is available. */
+    public static final long CAP_THREAD_AFFINITY = 16;
+
     private static final boolean loaded = load();
     private static final long capabilities = queryCapabilities();
 
@@ -97,6 +100,20 @@ public final class GStreamerCaptureJNI {
     public static native long createWithOptions(String pipeline, int outputMode);
 
     public static native long getCapabilities();
+
+    /**
+     * Limits the calling thread to the CPUs of a bit mask (bit n = CPU n). Threads that the calling
+     * thread starts after this call get the same limit.
+     *
+     * @return True if the kernel accepted the mask.
+     */
+    public static native boolean setCurrentThreadCpuMask(long cpuMask);
+
+    /**
+     * Test aid for simulations of a slower processor. After each JPEG frame, the library decodes this
+     * percent of the frame again and discards the pixels. 0 = no extra work (default).
+     */
+    public static native void setTestExtraDecodePercent(int percent);
 
     /** Returns true if the GStreamer registry of this machine has the element. */
     public static native boolean hasElement(String elementName);

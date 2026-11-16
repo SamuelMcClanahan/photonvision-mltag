@@ -21,6 +21,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.opencv.core.RotatedRect;
 import org.photonvision.common.configuration.ConfigManager;
 import org.photonvision.common.configuration.NeuralNetworkModelManager;
@@ -28,11 +32,13 @@ import org.photonvision.common.dataflow.structures.Packet;
 import org.photonvision.common.hardware.Platform;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.estimation.TargetModel;
 import org.photonvision.targeting.MultiTargetPNPResult;
 import org.photonvision.vision.apriltag.AprilTagFamily;
 import org.photonvision.vision.frame.Frame;
+import org.photonvision.vision.frame.FrameStaticProperties;
 import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.objects.Model;
 import org.photonvision.vision.pipe.CVPipe.CVPipeResult;
@@ -46,6 +52,7 @@ import org.photonvision.vision.pipe.impl.AprilTagROIDetectionPipe;
 import org.photonvision.vision.pipe.impl.CalculateFPSPipe;
 import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe;
 import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe.MultiTargetPNPPipeParams;
+import org.photonvision.vision.pipe.impl.VisionWorkerPool;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
 import org.photonvision.vision.target.TrackedTarget;
 import org.photonvision.vision.target.TrackedTarget.TargetCalculationParameters;
@@ -65,6 +72,18 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     private final AprilTagDetectionPipe aprilTagDetectionPipe = new AprilTagDetectionPipe();
     private final AprilTagPoseEstimatorPipe singleTagPoseEstimatorPipe =
             new AprilTagPoseEstimatorPipe();
+
+    /**
+     * Estimate the poses of different tags on different threads. The estimate of one tag does not use
+     * data of a different tag, so the poses are equal to the poses of the serial calculation. Set
+     * PV_MLTAG_PARALLEL_POSE=false to estimate all poses on the vision thread.
+     */
+    private static final boolean PARALLEL_POSE = EnvUtils.flag("PV_MLTAG_PARALLEL_POSE", true);
+
+    // One pose pipe for each group of tags that runs at the same time. Index 0 is
+    // singleTagPoseEstimatorPipe. A pipe keeps scratch data, so two threads cannot share one.
+    private final List<AprilTagPoseEstimatorPipe> posePipes = new ArrayList<>();
+    private AprilTagPoseEstimatorPipeParams poseParams = null;
     private final MultiTargetPNPPipe multiTagPNPPipe = new MultiTargetPNPPipe();
     private final CalculateFPSPipe calculateFPSPipe = new CalculateFPSPipe();
 
@@ -75,10 +94,24 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     private boolean pipeParamsConfigured = false;
     private int lastPipeParamsHash = 0;
 
-    // Frames that are in model inference. Only used when the hybrid pipe has more than one lane.
-    private final ArrayDeque<AprilTagMLHybridPipe.PendingDetection> pendingDetections =
-            new ArrayDeque<>();
+    // Frames that are in work. Only used when the hybrid pipe has more than one inference lane.
+    private record PendingFrame(Frame frame, Future<CVPipelineResult> result) {}
+
+    private final ArrayDeque<PendingFrame> pendingFrames = new ArrayDeque<>();
     private InferenceOverlapController overlapController;
+
+    /**
+     * The work thread of this pipeline for the multi-lane mode. It does the work that follows the
+     * model inference (tag decode, pose) for one frame after the other, in the capture order. The
+     * vision thread then only starts frames and returns results, so a slow frame does not stop it
+     * from getting the next camera frame.
+     */
+    private ExecutorService frameWorker;
+
+    private static final AtomicInteger frameWorkerNumber = new AtomicInteger();
+
+    // Time of the tag decode and pose work of the last frame. Written by the work thread.
+    private volatile long lastPostInferenceNanos = -1;
 
     /** A pending frame that is older than this is not completed. Its result has no use. */
     private static final long STALE_PENDING_NANOS = 500_000_000L;
@@ -99,7 +132,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
      * @param settings The pipeline settings.
      * @param inferenceLanes Number of frames that can be in model inference at the same time.
      */
-    AprilTagPipeline(AprilTagPipelineSettings settings, int inferenceLanes) {
+    public AprilTagPipeline(AprilTagPipelineSettings settings, int inferenceLanes) {
         super(PROCESSING_TYPE);
         this.settings = settings;
         this.mlHybridPipe = new AprilTagMLHybridPipe(inferenceLanes);
@@ -123,9 +156,9 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             return;
         }
 
-        // The settings changed. Frames that are in inference use the old model and the old settings.
+        // The settings changed. Frames that are in work use the old model and the old settings.
         // Wait for them and release them before the pipes get new parameters.
-        discardPendingDetections();
+        discardPendingFrames();
 
         // for now, hard code tag width based on enum value
         // From 2024 best guess is 6.5
@@ -166,11 +199,15 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                 var fx = cameraMatrix.get(0, 0)[0];
                 var fy = cameraMatrix.get(1, 1)[0];
 
-                singleTagPoseEstimatorPipe.setParams(
+                poseParams =
                         new AprilTagPoseEstimatorPipeParams(
                                 new Config(tagWidth, fx, fy, cx, cy),
                                 frameStaticProperties.cameraCalibration,
-                                settings.numIterations));
+                                settings.numIterations);
+                singleTagPoseEstimatorPipe.setParams(poseParams);
+                for (AprilTagPoseEstimatorPipe posePipe : posePipes) {
+                    posePipe.setParams(poseParams);
+                }
 
                 // TODO global state ew
                 var atfl = ConfigManager.getInstance().getConfig().getApriltagFieldLayout();
@@ -254,8 +291,8 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         if (useML && mlHybridPipe.getLaneCount() > 1) {
             return processWithInferenceLanes(frame, settings);
         }
-        if (!pendingDetections.isEmpty()) {
-            discardPendingDetections();
+        if (!pendingFrames.isEmpty()) {
+            discardPendingFrames();
         }
 
         // Perform AprilTag detection (traditional or ML-assisted)
@@ -281,80 +318,119 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     }
 
     /**
-     * ML detection with more than one frame in model inference at the same time.
+     * ML detection with more than one frame in work at the same time.
      *
-     * <p>This method starts the inference of the input frame. Then it completes the oldest frame that
-     * is in inference, and returns the result of that frame. The frames are completed in the capture
-     * order, and each frame gets the same processing as in {@link #process}.
+     * <p>This method starts the work of the input frame: the model inference on a free lane, then the
+     * tag decode and the pose estimation on the work thread of this pipeline. Then it returns the
+     * result of the oldest frame that is in work. The results are returned in the capture order, and
+     * each frame gets the same processing as in {@link #process}.
      *
-     * <p>{@link InferenceOverlapController} decides if a call completes its own frame (when the
-     * pipeline is faster than the camera) or an earlier frame (when the model inference is slower
-     * than the camera frame period).
+     * <p>{@link InferenceOverlapController} decides if a call returns the result of its own frame
+     * (when the pipeline is faster than the camera) or of an earlier frame (when the work for one
+     * frame takes longer than the camera frame period).
      *
-     * @return The result of the oldest frame, or null if no frame is complete.
+     * @return The result of the oldest frame, or null if this call gives no result.
      */
     private CVPipelineResult processWithInferenceLanes(
             Frame frame, AprilTagPipelineSettings settings) {
         if (overlapController == null) {
-            overlapController = new InferenceOverlapController(mlHybridPipe.getLaneCount());
+            overlapController =
+                    new InferenceOverlapController(
+                            mlHybridPipe.getLaneCount(),
+                            EnvUtils.decimal(
+                                    "PV_MLTAG_OVERLAP_RESERVE", InferenceOverlapController.DEFAULT_RESERVE));
         }
-        discardStalePendingDetections(frame.timestampNanos);
+        if (frameWorker == null) {
+            frameWorker =
+                    Executors.newSingleThreadExecutor(
+                            runnable -> {
+                                Thread thread =
+                                        new Thread(runnable, "MLTag-Frame-" + frameWorkerNumber.incrementAndGet());
+                                thread.setDaemon(true);
+                                return thread;
+                            });
+        }
+        discardStalePendingFrames(frame.timestampNanos);
 
         var action =
                 overlapController.onFrame(
                         System.nanoTime(),
                         frame.timestampNanos,
-                        pendingDetections.size(),
+                        pendingFrames.size(),
                         mlHybridPipe.getInferenceNanosAverage(),
                         mlHybridPipe.getInferenceSamples());
 
-        if (action == InferenceOverlapController.Action.SKIP_INPUT && !pendingDetections.isEmpty()) {
-            // The pipeline goes back to one frame at a time. This call must complete an earlier
-            // frame, so it cannot also complete the input frame.
+        if (action == InferenceOverlapController.Action.SKIP_INPUT && !pendingFrames.isEmpty()) {
+            // The pipeline goes back to one frame at a time. This call must return an earlier
+            // frame, so it cannot also return the input frame.
             frame.release();
         } else {
-            pendingDetections.addLast(mlHybridPipe.submit(frame));
+            // The inference starts now on a lane. The work thread takes the frames in the capture
+            // order: it waits for the inference of a frame and then does the remaining work.
+            final var detection = mlHybridPipe.submit(frame);
+            final AprilTagPipelineSettings frameSettings = settings;
+            pendingFrames.addLast(
+                    new PendingFrame(frame, frameWorker.submit(() -> finishFrame(detection, frameSettings))));
             if (action == InferenceOverlapController.Action.DEFER) {
                 overlapController.onCallEnd(System.nanoTime(), -1);
                 return null;
             }
         }
 
-        var pending = pendingDetections.removeFirst();
-        CVPipelineResult result;
-        long postInferenceNanos = -1;
-        try {
-            var completed = mlHybridPipe.complete(pending);
-            long buildStart = System.nanoTime();
-            result =
-                    buildResult(
-                            pending.frame,
-                            settings,
-                            completed.result().detections(),
-                            completed.nanosElapsed(),
-                            completed.result().rois());
-            postInferenceNanos = completed.decodeNanos() + System.nanoTime() - buildStart;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            pending.await();
-            result = new CVPipelineResult(pending.frame.sequenceID, 0, 0, List.of(), pending.frame);
-        } catch (Exception e) {
-            logger.error("ML AprilTag inference failed", e);
-            result = new CVPipelineResult(pending.frame.sequenceID, 0, 0, List.of(), pending.frame);
-        }
-        overlapController.onCallEnd(System.nanoTime(), postInferenceNanos);
+        var pending = pendingFrames.removeFirst();
+        CVPipelineResult result = awaitResult(pending);
+        overlapController.onCallEnd(System.nanoTime(), lastPostInferenceNanos);
         return result;
     }
 
-    /** Releases pending frames that are too old, for example after this pipeline was not active. */
-    private void discardStalePendingDetections(long newestTimestampNanos) {
+    /** Runs on the work thread: the work for one frame that follows the model inference. */
+    private CVPipelineResult finishFrame(
+            AprilTagMLHybridPipe.PendingDetection detection, AprilTagPipelineSettings frameSettings) {
+        try {
+            var completed = mlHybridPipe.complete(detection);
+            long buildStart = System.nanoTime();
+            CVPipelineResult result =
+                    buildResult(
+                            detection.frame,
+                            frameSettings,
+                            completed.result().detections(),
+                            completed.nanosElapsed(),
+                            completed.result().rois());
+            lastPostInferenceNanos = completed.decodeNanos() + System.nanoTime() - buildStart;
+            return result;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            detection.await();
+            return new CVPipelineResult(detection.frame.sequenceID, 0, 0, List.of(), detection.frame);
+        } catch (Exception e) {
+            logger.error("ML AprilTag frame processing failed", e);
+            detection.await();
+            return new CVPipelineResult(detection.frame.sequenceID, 0, 0, List.of(), detection.frame);
+        }
+    }
+
+    /** Waits for the result of a frame. Always returns a result that owns the frame. */
+    private CVPipelineResult awaitResult(PendingFrame pending) {
+        try {
+            CVPipelineResult result = pending.result().get();
+            if (result != null) {
+                return result;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            logger.error("ML AprilTag frame processing failed", e);
+        }
+        return new CVPipelineResult(pending.frame().sequenceID, 0, 0, List.of(), pending.frame());
+    }
+
+    /** Releases frames that are too old, for example after this pipeline was not active. */
+    private void discardStalePendingFrames(long newestTimestampNanos) {
         boolean discarded = false;
-        while (!pendingDetections.isEmpty()
-                && newestTimestampNanos - pendingDetections.peekFirst().frame.timestampNanos
+        while (!pendingFrames.isEmpty()
+                && newestTimestampNanos - pendingFrames.peekFirst().frame().timestampNanos
                         > STALE_PENDING_NANOS) {
-            var stale = pendingDetections.removeFirst();
-            stale.await();
-            stale.frame.release();
+            awaitResult(pendingFrames.removeFirst()).release();
             discarded = true;
         }
         if (discarded && overlapController != null) {
@@ -362,11 +438,10 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         }
     }
 
-    private void discardPendingDetections() {
-        while (!pendingDetections.isEmpty()) {
-            var pending = pendingDetections.removeFirst();
-            pending.await();
-            pending.frame.release();
+    /** Waits for all frames that are in work and releases them. */
+    private void discardPendingFrames() {
+        while (!pendingFrames.isEmpty()) {
+            awaitResult(pendingFrames.removeFirst()).release();
         }
         if (overlapController != null) {
             overlapController.reset();
@@ -385,6 +460,12 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             long detectionNanos,
             List<RotatedRect> mlDetectionRois) {
         long sumPipeNanosElapsed = detectionNanos;
+        // In the multi-lane mode this method runs on the work thread, so it uses the properties
+        // of its frame and not the field that the vision thread sets for each call.
+        final FrameStaticProperties frameStaticProperties =
+                frame.frameStaticProperties != null
+                        ? frame.frameStaticProperties
+                        : this.frameStaticProperties;
 
         List<AprilTagDetection> usedDetections = new ArrayList<>();
         List<TrackedTarget> targetList = new ArrayList<>();
@@ -425,16 +506,25 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             // TODO global state again ew
             var atfl = ConfigManager.getInstance().getConfig().getApriltagFieldLayout();
 
-            for (AprilTagDetection detection : usedDetections) {
-                AprilTagPoseEstimate tagPoseEstimate = null;
-                // Do single-tag estimation when "always enabled" or if a tag was not used for multitag
-                if (settings.doSingleTargetAlways
-                        || !(multiTagResult.isPresent()
-                                && multiTagResult.get().fiducialIDsUsed.contains((short) detection.getId()))) {
-                    var poseResult = singleTagPoseEstimatorPipe.run(detection);
-                    sumPipeNanosElapsed += poseResult.nanosElapsed;
-                    tagPoseEstimate = poseResult.output;
-                }
+            // Do single-tag estimation when "always enabled" or if a tag was not used for multitag
+            boolean[] needsSingleTagPose = new boolean[usedDetections.size()];
+            for (int i = 0; i < usedDetections.size(); i++) {
+                needsSingleTagPose[i] =
+                        settings.doSingleTargetAlways
+                                || !(multiTagResult.isPresent()
+                                        && multiTagResult
+                                                .get()
+                                                .fiducialIDsUsed
+                                                .contains((short) usedDetections.get(i).getId()));
+            }
+            AprilTagPoseEstimate[] singleTagPoses = new AprilTagPoseEstimate[usedDetections.size()];
+            sumPipeNanosElapsed +=
+                    estimateSingleTagPoses(
+                            usedDetections, needsSingleTagPose, singleTagPoses, frameStaticProperties);
+
+            for (int detectionIndex = 0; detectionIndex < usedDetections.size(); detectionIndex++) {
+                AprilTagDetection detection = usedDetections.get(detectionIndex);
+                AprilTagPoseEstimate tagPoseEstimate = singleTagPoses[detectionIndex];
 
                 // If single-tag estimation was not done, this tag was used in multi-tag estimation
                 if (tagPoseEstimate == null && multiTagResult.isPresent()) {
@@ -500,6 +590,117 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     }
 
     /**
+     * Estimates the single-tag poses. With two or more tags, the tags are put into groups and the
+     * groups run at the same time on the calling thread and on the shared worker pool. The result for
+     * each tag is the same as the result of a serial calculation.
+     *
+     * @param detections The detections of the frame.
+     * @param needsPose Selects the detections that get a pose.
+     * @param poses Output: the pose of each selected detection, at the index of the detection.
+     * @param frameStaticProperties The static properties of the frame of the detections.
+     * @return The sum of the calculation time of all tags, in nanoseconds.
+     */
+    private long estimateSingleTagPoses(
+            List<AprilTagDetection> detections,
+            boolean[] needsPose,
+            AprilTagPoseEstimate[] poses,
+            FrameStaticProperties frameStaticProperties) {
+        List<Integer> selected = new ArrayList<>(detections.size());
+        for (int i = 0; i < detections.size(); i++) {
+            if (needsPose[i]) {
+                selected.add(i);
+            }
+        }
+        if (selected.isEmpty()) {
+            return 0;
+        }
+
+        int groupCount =
+                PARALLEL_POSE && poseParams != null
+                        ? Math.min(selected.size(), VisionWorkerPool.maxGroups(settings.threads))
+                        : 1;
+        if (groupCount <= 1) {
+            long nanos = 0;
+            for (int index : selected) {
+                var poseResult = singleTagPoseEstimatorPipe.run(detections.get(index));
+                nanos += poseResult.nanosElapsed;
+                poses[index] = poseResult.output;
+            }
+            return nanos;
+        }
+
+        // Create the calibration matrices on this thread before other threads read them.
+        frameStaticProperties.cameraCalibration.getCameraIntrinsicsMat();
+        frameStaticProperties.cameraCalibration.getDistCoeffsMat();
+
+        if (posePipes.isEmpty()) {
+            posePipes.add(singleTagPoseEstimatorPipe);
+        }
+        while (posePipes.size() < groupCount) {
+            var posePipe = new AprilTagPoseEstimatorPipe();
+            posePipe.setParams(poseParams);
+            posePipes.add(posePipe);
+        }
+
+        long[] groupNanos = new long[groupCount];
+        List<Future<?>> futures = new ArrayList<>(groupCount - 1);
+        for (int group = 1; group < groupCount; group++) {
+            final int groupIndex = group;
+            futures.add(
+                    VisionWorkerPool.EXECUTOR.submit(
+                            () ->
+                                    estimatePoseGroup(
+                                            detections, selected, groupIndex, groupCount, poses, groupNanos)));
+        }
+        estimatePoseGroup(detections, selected, 0, groupCount, poses, groupNanos);
+
+        boolean failed = false;
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failed = true;
+            } catch (Exception e) {
+                logger.error("Parallel pose estimation failed", e);
+                failed = true;
+            }
+        }
+        if (failed) {
+            // All tasks are complete here. Calculate the poses that are missing on this thread.
+            for (int index : selected) {
+                if (poses[index] == null) {
+                    poses[index] = singleTagPoseEstimatorPipe.run(detections.get(index)).output;
+                }
+            }
+        }
+
+        long nanos = 0;
+        for (long value : groupNanos) {
+            nanos += value;
+        }
+        return nanos;
+    }
+
+    private void estimatePoseGroup(
+            List<AprilTagDetection> detections,
+            List<Integer> selected,
+            int group,
+            int groupCount,
+            AprilTagPoseEstimate[] poses,
+            long[] groupNanos) {
+        AprilTagPoseEstimatorPipe posePipe = posePipes.get(group);
+        long nanos = 0;
+        for (int i = group; i < selected.size(); i += groupCount) {
+            int index = selected.get(i);
+            var poseResult = posePipe.run(detections.get(index));
+            nanos += poseResult.nanosElapsed;
+            poses[index] = poseResult.output;
+        }
+        groupNanos[group] = nanos;
+    }
+
+    /**
      * Checks if ML detection is available on the current platform. Currently supported: RK3588
      * (Orange Pi 5, Rock 5C, CoolPi 4B), QCS6490 (Rubik Pi 3), and NVIDIA Jetson via TensorRT.
      */
@@ -522,9 +723,19 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
 
     @Override
     public void release() {
-        discardPendingDetections();
+        discardPendingFrames();
+        if (frameWorker != null) {
+            frameWorker.shutdownNow();
+            frameWorker = null;
+        }
         aprilTagDetectionPipe.release();
         singleTagPoseEstimatorPipe.release();
+        for (AprilTagPoseEstimatorPipe posePipe : posePipes) {
+            if (posePipe != singleTagPoseEstimatorPipe) {
+                posePipe.release();
+            }
+        }
+        posePipes.clear();
         mlHybridPipe.release();
         super.release();
     }
