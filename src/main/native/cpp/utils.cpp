@@ -47,6 +47,15 @@ float get_dequant_value(void* data, TfLiteType tensor_type, int idx,
 
 bool tensor_image_dims(const TfLiteTensor* tensor, int* w, int* h, int* c) {
   int n = TfLiteTensorNumDims(tensor);
+  if (n == 4 && TfLiteTensorDim(tensor, 0) == 1 &&
+      TfLiteTensorDim(tensor, 1) > 0 && TfLiteTensorDim(tensor, 1) <= 4 &&
+      TfLiteTensorDim(tensor, 2) > 4 && TfLiteTensorDim(tensor, 3) > 4) {
+    if (w) *w = TfLiteTensorDim(tensor, 3);
+    if (h) *h = TfLiteTensorDim(tensor, 2);
+    if (c) *c = TfLiteTensorDim(tensor, 1);
+    return true;
+  }
+
   int cursor = 0;
 
   for (int i = 0; i < n; i++) {

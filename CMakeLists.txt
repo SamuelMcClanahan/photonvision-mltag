@@ -20,6 +20,8 @@ if(ENABLE_ASAN)
 endif()
 
 set(BUILD_SHARED_LIBS ON)
+option(USE_SYSTEM_TFLITE "Link against the target system TensorFlow Lite C API" OFF)
+option(USE_DIRECT_QNN_DELEGATE "Use Qualcomm's direct QNN TFLite delegate C API" OFF)
 
 find_package(JNI REQUIRED COMPONENTS JVM)
 
@@ -95,14 +97,40 @@ file(GLOB NATIVE_SOURCES src/main/native/cpp/*.cpp)
 
 add_library(${PROJECT_NAME} ${NATIVE_SOURCES})
 
+if(USE_SYSTEM_TFLITE)
+    find_library(SYSTEM_TFLITE_C tensorflowlite_c REQUIRED)
+    message(STATUS "Using system TensorFlow Lite C API: ${SYSTEM_TFLITE_C}")
+    set(TFLITE_LIBS ${SYSTEM_TFLITE_C})
+    set(TFLITE_INSTALL_LIBS)
+else()
+    set(TFLITE_LIBS
+        ${LIB_PATH}/libtensorflowlite_c.so
+        ${LIB_PATH}/libtensorflowlite.so
+        ${LIB_PATH}/libexternal_delegate.so
+    )
+    set(TFLITE_INSTALL_LIBS
+        ${LIB_PATH}/libtensorflowlite_c.so
+        ${LIB_PATH}/libtensorflowlite.so
+        ${LIB_PATH}/libexternal_delegate.so
+    )
+endif()
+
+if(USE_DIRECT_QNN_DELEGATE)
+    find_library(QNN_TFLITE_DELEGATE QnnTFLiteDelegate REQUIRED)
+    message(STATUS "Using direct QNN TFLite delegate: ${QNN_TFLITE_DELEGATE}")
+    list(APPEND TFLITE_LIBS ${QNN_TFLITE_DELEGATE})
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_DIRECT_QNN_DELEGATE)
+elseif(USE_SYSTEM_TFLITE)
+    list(APPEND TFLITE_LIBS ${LIB_PATH}/libexternal_delegate.so)
+    list(APPEND TFLITE_INSTALL_LIBS ${LIB_PATH}/libexternal_delegate.so)
+endif()
+
 target_link_libraries(
     ${PROJECT_NAME}
     PUBLIC
         Threads::Threads
         ${OPENCV_LIB_PATH}
-        ${LIB_PATH}/libtensorflowlite_c.so
-        ${LIB_PATH}/libtensorflowlite.so
-        ${LIB_PATH}/libexternal_delegate.so
+        ${TFLITE_LIBS}
 )
 
 target_include_directories(
@@ -117,10 +145,10 @@ target_include_directories(
 
 include(GNUInstallDirs)
 install(TARGETS ${PROJECT_NAME})
-install(
-    FILES
-        ${LIB_PATH}/libtensorflowlite_c.so
-        ${LIB_PATH}/libtensorflowlite.so
-        ${LIB_PATH}/libexternal_delegate.so
-    TYPE LIB
-)
+if(TFLITE_INSTALL_LIBS)
+    install(
+        FILES
+            ${TFLITE_INSTALL_LIBS}
+        TYPE LIB
+    )
+endif()

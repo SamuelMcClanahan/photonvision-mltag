@@ -40,7 +40,10 @@ public class RubikTest {
             System.out.println(Core.OpenCLApiCallError);
 
             System.out.println("Loading rubik_jni");
-            System.load("/home/photon/rubik_jni/cmake_build/librubik_jni.so");
+            System.load(
+                    System.getProperty(
+                            "rubikJniLib",
+                            "/home/photon/rubik_jni-pv-qnn-fix/cmake_build/lib/librubik_jni.so"));
 
             System.out.println("Loading image: " + imagePath);
             Mat img = Imgcodecs.imread(imagePath);
@@ -58,16 +61,19 @@ public class RubikTest {
                 throw new RuntimeException("Failed to create Rubik detector");
             }
 
-            System.out.println("Rubik detector created: " + ptr);
+            RubikResult[] ret;
+            try {
+                System.out.println("Rubik detector created: " + ptr);
 
-            assertTrue(RubikJNI.isQuantized(ptr), "Rubik detector should be quantized");
+                assertTrue(RubikJNI.isQuantized(ptr), "Rubik detector should be quantized");
 
-            RubikResult[] ret = RubikJNI.detect(ptr, img.getNativeObjAddr(), 0.5f, 0.45f);
+                ret = RubikJNI.detect(ptr, img.getNativeObjAddr(), 0.5f, 0.45f);
 
-            System.out.println("Detection results: " + Arrays.toString(ret));
-
-            System.out.println("Releasing Rubik detector");
-            RubikJNI.destroy(ptr);
+                System.out.println("Detection results: " + Arrays.toString(ret));
+            } finally {
+                System.out.println("Releasing Rubik detector");
+                RubikJNI.destroy(ptr);
+            }
 
             for (RubikResult result : ret) {
                 System.out.println("Result: " + result);
@@ -103,6 +109,15 @@ public class RubikTest {
     public void testYoloV8() {
         testModel(
                 "src/test/resources/models/yolov8nCoco.tflite", "src/test/resources/images/bus.jpg", 1);
+    }
+
+    @Test
+    public void testAprilTagYolo11Int8() {
+        testModel(
+                System.getProperty(
+                        "apriltagModel", "/home/photon/qcom-models/apriltag-yolo11n-640-int8.tflite"),
+                "src/test/resources/images/bus.jpg",
+                2);
     }
 
     // Helper method to determine if the memory leak test should be enabled

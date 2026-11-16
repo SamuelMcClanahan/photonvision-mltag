@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,10 +35,93 @@
 
 #include "utils.hpp"
 
+static float tensorValue(const TfLiteTensor* tensor, int idx) {
+  TfLiteQuantizationParams params = TfLiteTensorQuantizationParams(tensor);
+  return get_dequant_value(TfLiteTensorData(tensor), TfLiteTensorType(tensor),
+                           idx, params.zero_point, params.scale);
+}
+
+static std::vector<DetectResult> yoloSingleOutputPostProc(
+    const TfLiteTensor* outputTensor, double boxThresh, double nmsThreshold,
+    int input_img_width, int input_img_height) {
+  const int dims = TfLiteTensorNumDims(outputTensor);
+  if (dims != 3 || TfLiteTensorDim(outputTensor, 0) != 1) {
+    throw std::runtime_error("Unsupported single-output YOLO tensor shape");
+  }
+
+  int attributes = TfLiteTensorDim(outputTensor, 1);
+  int numBoxes = TfLiteTensorDim(outputTensor, 2);
+  bool attributesFirst = true;
+  if (attributes != 5 && TfLiteTensorDim(outputTensor, 2) == 5) {
+    attributes = TfLiteTensorDim(outputTensor, 2);
+    numBoxes = TfLiteTensorDim(outputTensor, 1);
+    attributesFirst = false;
+  }
+
+  if (attributes < 5 || numBoxes <= 0) {
+    throw std::runtime_error("Unsupported single-output YOLO tensor layout");
+  }
+
+  DEBUG_PRINT("INFO: Detected %d YOLO candidates\n", numBoxes);
+
+  std::vector<DetectResult> candidateResults;
+  candidateResults.reserve(numBoxes / 16);
+
+  auto at = [&](int box, int attr) {
+    const int idx = attributesFirst ? attr * numBoxes + box : box * attributes + attr;
+    return tensorValue(outputTensor, idx);
+  };
+
+  for (int i = 0; i < numBoxes; ++i) {
+    const float score = at(i, 4);
+    if (score < boxThresh) {
+      continue;
+    }
+
+    const float cx = at(i, 0);
+    const float cy = at(i, 1);
+    const float width = at(i, 2);
+    const float height = at(i, 3);
+
+    const float x1 = cx - width * 0.5f;
+    const float y1 = cy - height * 0.5f;
+    const float x2 = cx + width * 0.5f;
+    const float y2 = cy + height * 0.5f;
+
+    float clamped_x1 =
+        std::max(0.0f, std::min(x1, static_cast<float>(input_img_width)));
+    float clamped_y1 =
+        std::max(0.0f, std::min(y1, static_cast<float>(input_img_height)));
+    float clamped_x2 =
+        std::max(0.0f, std::min(x2, static_cast<float>(input_img_width)));
+    float clamped_y2 =
+        std::max(0.0f, std::min(y2, static_cast<float>(input_img_height)));
+
+    if (clamped_x1 >= clamped_x2 || clamped_y1 >= clamped_y2) {
+      continue;
+    }
+
+    BoundingBox box{static_cast<int>(std::round(clamped_x1)),
+                    static_cast<int>(std::round(clamped_y1)),
+                    static_cast<int>(std::round(clamped_x2)),
+                    static_cast<int>(std::round(clamped_y2)), 0.0};
+
+    candidateResults.push_back(DetectResult{0, box, score});
+  }
+
+  return optimizedNMS(candidateResults, static_cast<float>(nmsThreshold));
+}
+
 std::vector<DetectResult> yoloPostProc(TfLiteInterpreter* interpreter,
                                        double boxThresh, double nmsThreshold,
                                        int input_img_width,
                                        int input_img_height) {
+  if (TfLiteInterpreterGetOutputTensorCount(interpreter) == 1) {
+    return yoloSingleOutputPostProc(
+        TfLiteInterpreterGetOutputTensor(interpreter, 0), boxThresh,
+        nmsThreshold, input_img_width, input_img_height);
+  }
+
   const TfLiteTensor* boxesTensor =
       TfLiteInterpreterGetOutputTensor(interpreter, 0);
   const TfLiteTensor* scoresTensor =

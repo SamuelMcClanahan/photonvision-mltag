@@ -20,9 +20,12 @@
  */
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,6 +37,9 @@
 #include <tensorflow/lite/c/c_api_experimental.h>
 #include <tensorflow/lite/delegates/external/external_delegate.h>
 #include <tensorflow/lite/version.h>
+#ifdef USE_DIRECT_QNN_DELEGATE
+#include <QNN/TFLiteDelegate/QnnTFLiteDelegate.h>
+#endif
 
 #include "utils.hpp"
 #include "yoloPostProc.hpp"
@@ -42,6 +48,16 @@ static jclass runtimeExceptionClass = nullptr;
 
 // JNI class reference (this can be global since it's shared)
 static jclass detectionResultClass = nullptr;
+
+static bool envFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) return false;
+  std::string normalized(value);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return normalized == "1" || normalized == "true" || normalized == "yes" ||
+         normalized == "on";
+}
 
 extern "C" {
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -151,6 +167,15 @@ Java_org_photonvision_rubik_RubikJNI_create
 
   DEBUG_PRINT("INFO: Loaded model file '%s'\n", model_name);
 
+  TfLiteDelegate* delegate = nullptr;
+
+#ifdef USE_DIRECT_QNN_DELEGATE
+  TfLiteQnnDelegateOptions qnnOpts = TfLiteQnnDelegateOptionsDefault();
+  qnnOpts.backend_type = kHtpBackend;
+  qnnOpts.htp_options.precision = kHtpQuantized;
+  qnnOpts.htp_options.useConvHmx = false;
+  delegate = TfLiteQnnDelegateCreate(&qnnOpts);
+#else
   // Create external delegate options
   // We just have to trust that this creates okay, but conveniently if it fails
   // the check when we insert options will catch it.
@@ -169,22 +194,24 @@ Java_org_photonvision_rubik_RubikJNI_create
     return 0;
   }
 
-  if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "htp_use_conv_hmx",
+  if (envFlagEnabled("PV_RUBIK_QNN_USE_CONV_HMX") &&
+      TfLiteExternalDelegateOptionsInsert(delegateOpts, "htp_use_conv_hmx",
                                           "1") != kTfLiteOk) {
     ThrowRuntimeException(env, "Failed to enable convolutions");
     env->ReleaseStringUTFChars(modelPath, model_name);
     return 0;
   }
 
-  if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "htp_performance_mode",
+  if (envFlagEnabled("PV_RUBIK_QNN_PERFORMANCE_MODE") &&
+      TfLiteExternalDelegateOptionsInsert(delegateOpts, "htp_performance_mode",
                                           "2") != kTfLiteOk) {
     ThrowRuntimeException(env, "Failed to set htp performance mode");
     env->ReleaseStringUTFChars(modelPath, model_name);
     return 0;
   }
 
-  // Create the delegate
-  TfLiteDelegate* delegate = TfLiteExternalDelegateCreate(delegateOpts);
+  delegate = TfLiteExternalDelegateCreate(delegateOpts);
+#endif
 
   if (!delegate) {
     ThrowRuntimeException(env, "Failed to create external delegate");
@@ -200,12 +227,14 @@ Java_org_photonvision_rubik_RubikJNI_create
   TfLiteInterpreterOptions* interpreterOpts = TfLiteInterpreterOptionsCreate();
   if (!interpreterOpts) {
     ThrowRuntimeException(env, "Failed to create interpreter options");
+#ifdef USE_DIRECT_QNN_DELEGATE
+    TfLiteQnnDelegateDelete(delegate);
+#else
     TfLiteExternalDelegateDelete(delegate);
+#endif
     env->ReleaseStringUTFChars(modelPath, model_name);
     return 0;
   }
-
-  TfLiteInterpreterOptionsAddDelegate(interpreterOpts, delegate);
 
   // Create the interpreter
   TfLiteInterpreter* interpreter =
@@ -214,7 +243,11 @@ Java_org_photonvision_rubik_RubikJNI_create
 
   if (!interpreter) {
     ThrowRuntimeException(env, "Failed to create interpreter");
+#ifdef USE_DIRECT_QNN_DELEGATE
+    TfLiteQnnDelegateDelete(delegate);
+#else
     TfLiteExternalDelegateDelete(delegate);
+#endif
     env->ReleaseStringUTFChars(modelPath, model_name);
     return 0;
   }
@@ -224,7 +257,11 @@ Java_org_photonvision_rubik_RubikJNI_create
       kTfLiteOk) {
     ThrowRuntimeException(env, "Failed to modify graph with delegate");
     TfLiteInterpreterDelete(interpreter);
+#ifdef USE_DIRECT_QNN_DELEGATE
+    TfLiteQnnDelegateDelete(delegate);
+#else
     TfLiteExternalDelegateDelete(delegate);
+#endif
     env->ReleaseStringUTFChars(modelPath, model_name);
     return 0;
   } else {
@@ -235,7 +272,11 @@ Java_org_photonvision_rubik_RubikJNI_create
   if (TfLiteInterpreterAllocateTensors(interpreter) != kTfLiteOk) {
     ThrowRuntimeException(env, "Failed to allocate tensors");
     TfLiteInterpreterDelete(interpreter);
+#ifdef USE_DIRECT_QNN_DELEGATE
+    TfLiteQnnDelegateDelete(delegate);
+#else
     TfLiteExternalDelegateDelete(delegate);
+#endif
     env->ReleaseStringUTFChars(modelPath, model_name);
     return 0;
   }
@@ -275,7 +316,13 @@ Java_org_photonvision_rubik_RubikJNI_destroy
 
   // Now safely use the pointers
   if (detector->interpreter) TfLiteInterpreterDelete(detector->interpreter);
-  if (detector->delegate) TfLiteExternalDelegateDelete(detector->delegate);
+  if (detector->delegate) {
+#ifdef USE_DIRECT_QNN_DELEGATE
+    TfLiteQnnDelegateDelete(detector->delegate);
+#else
+    TfLiteExternalDelegateDelete(detector->delegate);
+#endif
+  }
   if (detector->model) TfLiteModelDelete(detector->model);
   // We don't need to delete the version since it's just an enum value not a
   // pointer
@@ -336,7 +383,53 @@ Java_org_photonvision_rubik_RubikJNI_detect
     return nullptr;
   }
 
-  std::memcpy(TfLiteTensorData(input), rgb.data, TfLiteTensorByteSize(input));
+  const bool nchwInput =
+      TfLiteTensorNumDims(input) == 4 && TfLiteTensorDim(input, 1) <= 4 &&
+      TfLiteTensorDim(input, 2) == input_img->rows &&
+      TfLiteTensorDim(input, 3) == input_img->cols;
+
+  TfLiteType inputType = TfLiteTensorType(input);
+  if (inputType == kTfLiteUInt8 && !nchwInput) {
+    if (TfLiteTensorCopyFromBuffer(input, rgb.data,
+                                   TfLiteTensorByteSize(input)) != kTfLiteOk) {
+      ThrowRuntimeException(env, "Failed to copy image into input tensor");
+      return nullptr;
+    }
+  } else if (inputType == kTfLiteFloat32) {
+    std::vector<float> tensorData(input_img->rows * input_img->cols * 3);
+    float* dst = tensorData.data();
+    if (nchwInput) {
+      const int planeSize = input_img->rows * input_img->cols;
+      for (int y = 0; y < input_img->rows; ++y) {
+        const cv::Vec3b* row = rgb.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < input_img->cols; ++x) {
+          const int idx = y * input_img->cols + x;
+          dst[idx] = row[x][0] / 255.0f;
+          dst[planeSize + idx] = row[x][1] / 255.0f;
+          dst[2 * planeSize + idx] = row[x][2] / 255.0f;
+        }
+      }
+    } else {
+      for (int y = 0; y < input_img->rows; ++y) {
+        const cv::Vec3b* row = rgb.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < input_img->cols; ++x) {
+          const int idx = (y * input_img->cols + x) * 3;
+          dst[idx] = row[x][0] / 255.0f;
+          dst[idx + 1] = row[x][1] / 255.0f;
+          dst[idx + 2] = row[x][2] / 255.0f;
+        }
+      }
+    }
+    if (TfLiteTensorCopyFromBuffer(input, tensorData.data(),
+                                   tensorData.size() * sizeof(float)) !=
+        kTfLiteOk) {
+      ThrowRuntimeException(env, "Failed to copy image into input tensor");
+      return nullptr;
+    }
+  } else {
+    ThrowRuntimeException(env, "Unsupported input tensor type/layout");
+    return nullptr;
+  }
 
 // Start timer for benchmark
 #ifndef NDEBUG
@@ -425,7 +518,8 @@ Java_org_photonvision_rubik_RubikJNI_isQuantized
   // Check if the tensor type is kTfLiteUInt8
   TfLiteType tensorType = TfLiteTensorType(input);
 
-  if (tensorType == kTfLiteUInt8) {
+  if (tensorType == kTfLiteUInt8 || tensorType == kTfLiteInt8 ||
+      tensorType == kTfLiteFloat32) {
     DEBUG_PRINT("INFO: Input tensor is quantized\n");
     return JNI_TRUE;  // The model is quantized
   } else {
