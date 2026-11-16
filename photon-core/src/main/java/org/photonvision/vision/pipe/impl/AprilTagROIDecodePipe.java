@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.opencv.core.Mat;
 import org.opencv.core.Point;
 import org.opencv.core.Rect;
@@ -56,16 +57,63 @@ public class AprilTagROIDecodePipe
         implements Releasable {
     private static final Logger logger =
             new Logger(AprilTagROIDecodePipe.class, LogGroup.VisionModule);
-    private static final boolean PARALLEL_ROI_DECODE = EnvUtils.flag("PV_MLTAG_PARALLEL_ROI_DECODE");
+
+    /**
+     * Decode different ROIs on different threads. This is on by default. Set
+     * PV_MLTAG_PARALLEL_ROI_DECODE=false to decode all ROIs on the vision thread.
+     */
+    private static final boolean PARALLEL_ROI_DECODE =
+            EnvUtils.flag("PV_MLTAG_PARALLEL_ROI_DECODE", true);
+
+    /**
+     * Maximum number of ROIs that one pipe decodes at the same time. 0 = use the "threads" setting of
+     * the AprilTag pipeline.
+     */
     private static final int PARALLEL_ROI_WORKERS =
-            Math.max(1, EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_WORKERS", 2));
+            Math.max(0, EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_WORKERS", 0));
+
+    /** Threads inside each detector of a parallel worker. One ROI is small, so the default is 1. */
     private static final int PARALLEL_DETECTOR_THREADS =
-            EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_DETECTOR_THREADS", 0);
+            Math.max(1, EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_DETECTOR_THREADS", 1));
+
     private static final int PARALLEL_ROI_MIN_COUNT =
             Math.max(2, EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_MIN_COUNT", 2));
+
+    /**
+     * A single ROI with this number of pixels or more is decoded with the multi-thread detector. A
+     * smaller ROI is decoded with a single-thread detector, because the cost to start the detector
+     * threads is then larger than the gain.
+     */
+    private static final int LARGE_ROI_PIXELS =
+            Math.max(0, EnvUtils.integer("PV_MLTAG_LARGE_ROI_PIXELS", 160_000));
+
     private static final boolean CONTIGUOUS_ROI_COPY = EnvUtils.flag("PV_MLTAG_CONTIGUOUS_ROI_COPY");
-    private static final boolean AREA_BALANCED_PARALLEL_ROIS =
-            EnvUtils.flag("PV_MLTAG_AREA_BALANCED_ROI_DECODE");
+
+    /** Hard limit for the number of detectors that one pipe makes. Each one uses about 19 MB. */
+    private static final int MAX_WORKERS_PER_PIPE = 8;
+
+    /**
+     * One pool for all cameras. With two cameras, two private pools would start more threads than the
+     * processor has cores. Each pipe also decodes one group of ROIs on its own thread.
+     */
+    private static final class SharedPool {
+        static final int THREADS =
+                Math.max(
+                        1,
+                        EnvUtils.integer(
+                                "PV_MLTAG_ROI_POOL_THREADS",
+                                Math.min(MAX_WORKERS_PER_PIPE, Runtime.getRuntime().availableProcessors()) - 1));
+        static final AtomicInteger threadNumber = new AtomicInteger();
+        static final ExecutorService EXECUTOR =
+                Executors.newFixedThreadPool(
+                        THREADS,
+                        runnable -> {
+                            Thread thread =
+                                    new Thread(runnable, "AprilTag-ROI-Decode-" + threadNumber.incrementAndGet());
+                            thread.setDaemon(true);
+                            return thread;
+                        });
+    }
 
     /** Context object containing ATR scaling information for a single ROI. */
     private static class ATRContext {
@@ -126,32 +174,24 @@ public class AprilTagROIDecodePipe
         }
     }
 
+    /** The detector with the thread count from the pipeline settings. Used for one large ROI. */
     private AprilTagDetector detector;
+
     private AprilTagFamily currentFamily;
     private final Mat resizedRoi = new Mat();
     private final Mat grayRoi = new Mat();
     private final Mat contiguousRoi = new Mat();
-    private final ExecutorService parallelExecutor;
+
+    /**
+     * Single-thread detectors, one for each group of ROIs that can run at the same time. They are
+     * made when they are first necessary, because each detector uses much memory.
+     */
     private final List<ParallelWorker> parallelWorkers = new ArrayList<>();
-    private int configuredParallelDetectorThreads = 0;
+
+    private int maxParallelWorkers = 1;
 
     public AprilTagROIDecodePipe() {
         detector = new AprilTagDetector();
-        if (PARALLEL_ROI_DECODE && PARALLEL_ROI_WORKERS > 1) {
-            parallelExecutor =
-                    Executors.newFixedThreadPool(
-                            PARALLEL_ROI_WORKERS,
-                            runnable -> {
-                                Thread thread = new Thread(runnable, "AprilTag-ROI-Decode");
-                                thread.setDaemon(true);
-                                return thread;
-                            });
-            for (int i = 0; i < PARALLEL_ROI_WORKERS; i++) {
-                parallelWorkers.add(new ParallelWorker());
-            }
-        } else {
-            parallelExecutor = null;
-        }
     }
 
     @Override
@@ -174,17 +214,25 @@ public class AprilTagROIDecodePipe
         return processSerial(input.rois, fullFrame, frameWidth, frameHeight);
     }
 
+    /**
+     * Decodes all ROIs on the calling thread. A large ROI uses the detector that has the thread count
+     * from the pipeline settings. A small ROI uses a single-thread detector.
+     */
     private List<AprilTagDetection> processSerial(
             List<RotatedRect> rois, Mat fullFrame, int frameWidth, int frameHeight) {
         List<AprilTagDetection> allDetections = new ArrayList<>();
         for (RotatedRect roi : rois) {
+            AprilTagDetector activeDetector = detector;
+            if (useSingleThreadDetector(roi, frameWidth, frameHeight)) {
+                activeDetector = getWorker(0).detector;
+            }
             RoiDecodeResult roiResult =
                     decodeOneRoi(
                             roi,
                             fullFrame,
                             frameWidth,
                             frameHeight,
-                            detector,
+                            activeDetector,
                             grayRoi,
                             resizedRoi,
                             contiguousRoi);
@@ -194,118 +242,120 @@ public class AprilTagROIDecodePipe
         return deduplicateByTagId(allDetections);
     }
 
-    private boolean isParallelDecodeActive(int roiCount) {
-        return PARALLEL_ROI_DECODE
-                && parallelExecutor != null
-                && parallelWorkers.size() > 1
-                && roiCount >= PARALLEL_ROI_MIN_COUNT;
+    private boolean useSingleThreadDetector(RotatedRect roi, int frameWidth, int frameHeight) {
+        if (!PARALLEL_ROI_DECODE || params == null || params.detectorConfig.numThreads <= 1) {
+            return false;
+        }
+        return roiPixelArea(roi, frameWidth, frameHeight) < LARGE_ROI_PIXELS;
     }
 
+    private boolean isParallelDecodeActive(int roiCount) {
+        return PARALLEL_ROI_DECODE && maxParallelWorkers > 1 && roiCount >= PARALLEL_ROI_MIN_COUNT;
+    }
+
+    /**
+     * Decodes groups of ROIs at the same time. The ROIs are put into groups that have almost the same
+     * number of pixels. The calling thread decodes one group, and the shared pool decodes the other
+     * groups. The result has the same detections in the same order as {@link #processSerial}.
+     */
     private List<AprilTagDetection> processParallel(
             List<RotatedRect> rois, Mat fullFrame, int frameWidth, int frameHeight) {
-        int workerCount = Math.min(parallelWorkers.size(), rois.size());
-        if (AREA_BALANCED_PARALLEL_ROIS && rois.size() > workerCount) {
-            return processParallelBalanced(rois, fullFrame, frameWidth, frameHeight, workerCount);
-        }
+        int groupCount = Math.min(maxParallelWorkers, rois.size());
+        List<List<Integer>> groups = balanceRoisByArea(rois, frameWidth, frameHeight, groupCount);
 
-        List<Future<WorkerDecodeResult>> futures = new ArrayList<>(Math.max(0, workerCount - 1));
+        @SuppressWarnings("unchecked")
+        List<AprilTagDetection>[] detectionsByRoi = new List[rois.size()];
 
-        for (int workerIndex = 1; workerIndex < workerCount; workerIndex++) {
-            final int startIndex = workerIndex;
-            final ParallelWorker worker = parallelWorkers.get(workerIndex);
-            futures.add(
-                    parallelExecutor.submit(
-                            () ->
-                                    decodeWorkerRois(
-                                            rois, startIndex, workerCount, fullFrame, frameWidth, frameHeight, worker)));
-        }
-
-        List<AprilTagDetection> allDetections = new ArrayList<>();
+        List<Future<?>> futures = new ArrayList<>(groupCount - 1);
         try {
-            WorkerDecodeResult callerResult =
-                    decodeWorkerRois(
-                            rois, 0, workerCount, fullFrame, frameWidth, frameHeight, parallelWorkers.get(0));
-            allDetections.addAll(callerResult.detections);
+            for (int groupIndex = 1; groupIndex < groupCount; groupIndex++) {
+                final List<Integer> group = groups.get(groupIndex);
+                final ParallelWorker worker = getWorker(groupIndex);
+                futures.add(
+                        SharedPool.EXECUTOR.submit(
+                                () ->
+                                        decodeRoiGroup(
+                                                rois, group, fullFrame, frameWidth, frameHeight, worker, detectionsByRoi)));
+            }
 
-            for (Future<WorkerDecodeResult> future : futures) {
-                WorkerDecodeResult workerResult = future.get();
-                allDetections.addAll(workerResult.detections);
+            decodeRoiGroup(
+                    rois, groups.get(0), fullFrame, frameWidth, frameHeight, getWorker(0), detectionsByRoi);
+
+            for (Future<?> future : futures) {
+                future.get();
             }
         } catch (Exception e) {
+            // Wait for the tasks that still run. They use the frame, and the caller releases the
+            // frame after this method returns.
+            for (Future<?> future : futures) {
+                try {
+                    future.get();
+                } catch (Exception ignored) {
+                    // The serial decode below gives the result.
+                }
+            }
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             logger.warn("Parallel ROI decode failed, falling back to serial decode: " + e.getMessage());
             return processSerial(rois, fullFrame, frameWidth, frameHeight);
         }
 
+        // Join the results in the ROI order, so the order does not depend on thread timing.
+        List<AprilTagDetection> allDetections = new ArrayList<>();
+        for (List<AprilTagDetection> roiDetections : detectionsByRoi) {
+            if (roiDetections != null) {
+                allDetections.addAll(roiDetections);
+            }
+        }
         return deduplicateByTagId(allDetections);
     }
 
-    private List<AprilTagDetection> processParallelBalanced(
-            List<RotatedRect> rois, Mat fullFrame, int frameWidth, int frameHeight, int workerCount) {
-        List<List<RotatedRect>> assignments = new ArrayList<>(workerCount);
-        long[] assignmentPixels = new long[workerCount];
-        for (int i = 0; i < workerCount; i++) {
-            assignments.add(new ArrayList<>());
+    /**
+     * Puts the ROI indexes into groups. The largest ROI goes first, and each ROI goes to the group
+     * that has the smallest pixel total at that time.
+     */
+    private List<List<Integer>> balanceRoisByArea(
+            List<RotatedRect> rois, int frameWidth, int frameHeight, int groupCount) {
+        List<List<Integer>> groups = new ArrayList<>(groupCount);
+        long[] groupPixels = new long[groupCount];
+        for (int i = 0; i < groupCount; i++) {
+            groups.add(new ArrayList<>());
         }
 
-        List<RotatedRect> sortedRois = new ArrayList<>(rois);
-        sortedRois.sort(
-                (a, b) ->
-                        Long.compare(
-                                roiPixelArea(b, frameWidth, frameHeight),
-                                roiPixelArea(a, frameWidth, frameHeight)));
-        for (RotatedRect roi : sortedRois) {
-            int lightestWorker = 0;
-            for (int i = 1; i < workerCount; i++) {
-                if (assignmentPixels[i] < assignmentPixels[lightestWorker]) {
-                    lightestWorker = i;
+        long[] areas = new long[rois.size()];
+        List<Integer> order = new ArrayList<>(rois.size());
+        for (int i = 0; i < rois.size(); i++) {
+            areas[i] = roiPixelArea(rois.get(i), frameWidth, frameHeight);
+            order.add(i);
+        }
+        order.sort((a, b) -> Long.compare(areas[b], areas[a]));
+
+        for (int roiIndex : order) {
+            int lightestGroup = 0;
+            for (int i = 1; i < groupCount; i++) {
+                if (groupPixels[i] < groupPixels[lightestGroup]) {
+                    lightestGroup = i;
                 }
             }
-            assignments.get(lightestWorker).add(roi);
-            assignmentPixels[lightestWorker] += roiPixelArea(roi, frameWidth, frameHeight);
+            groups.get(lightestGroup).add(roiIndex);
+            groupPixels[lightestGroup] += areas[roiIndex];
         }
-
-        List<Future<WorkerDecodeResult>> futures = new ArrayList<>(Math.max(0, workerCount - 1));
-        for (int workerIndex = 1; workerIndex < workerCount; workerIndex++) {
-            final List<RotatedRect> workerRois = assignments.get(workerIndex);
-            final ParallelWorker worker = parallelWorkers.get(workerIndex);
-            futures.add(
-                    parallelExecutor.submit(
-                            () -> decodeWorkerRoiList(workerRois, fullFrame, frameWidth, frameHeight, worker)));
-        }
-
-        List<AprilTagDetection> allDetections = new ArrayList<>();
-        try {
-            WorkerDecodeResult callerResult =
-                    decodeWorkerRoiList(
-                            assignments.get(0), fullFrame, frameWidth, frameHeight, parallelWorkers.get(0));
-            allDetections.addAll(callerResult.detections);
-
-            for (Future<WorkerDecodeResult> future : futures) {
-                WorkerDecodeResult workerResult = future.get();
-                allDetections.addAll(workerResult.detections);
-            }
-        } catch (Exception e) {
-            logger.warn(
-                    "Balanced parallel ROI decode failed, falling back to serial decode: " + e.getMessage());
-            return processSerial(rois, fullFrame, frameWidth, frameHeight);
-        }
-
-        return deduplicateByTagId(allDetections);
+        return groups;
     }
 
-    private WorkerDecodeResult decodeWorkerRois(
+    private void decodeRoiGroup(
             List<RotatedRect> rois,
-            int startIndex,
-            int stride,
+            List<Integer> group,
             Mat fullFrame,
             int frameWidth,
             int frameHeight,
-            ParallelWorker worker) {
-        WorkerDecodeResult workerResult = new WorkerDecodeResult();
-        for (int i = startIndex; i < rois.size(); i += stride) {
+            ParallelWorker worker,
+            List<AprilTagDetection>[] detectionsByRoi) {
+        for (int roiIndex : group) {
             RoiDecodeResult roiResult =
                     decodeOneRoi(
-                            rois.get(i),
+                            rois.get(roiIndex),
                             fullFrame,
                             frameWidth,
                             frameHeight,
@@ -313,32 +363,8 @@ public class AprilTagROIDecodePipe
                             worker.grayRoi,
                             worker.resizedRoi,
                             worker.contiguousRoi);
-            workerResult.detections.addAll(roiResult.detections);
+            detectionsByRoi[roiIndex] = roiResult.detections;
         }
-        return workerResult;
-    }
-
-    private WorkerDecodeResult decodeWorkerRoiList(
-            List<RotatedRect> rois,
-            Mat fullFrame,
-            int frameWidth,
-            int frameHeight,
-            ParallelWorker worker) {
-        WorkerDecodeResult workerResult = new WorkerDecodeResult();
-        for (RotatedRect roi : rois) {
-            RoiDecodeResult roiResult =
-                    decodeOneRoi(
-                            roi,
-                            fullFrame,
-                            frameWidth,
-                            frameHeight,
-                            worker.detector,
-                            worker.grayRoi,
-                            worker.resizedRoi,
-                            worker.contiguousRoi);
-            workerResult.detections.addAll(roiResult.detections);
-        }
-        return workerResult;
     }
 
     private RoiDecodeResult decodeOneRoi(
@@ -716,18 +742,28 @@ public class AprilTagROIDecodePipe
         if (newParams.tagFamily != currentFamily) {
             detector.clearFamilies();
             detector.addFamily(newParams.tagFamily.getNativeName());
-            for (ParallelWorker worker : parallelWorkers) {
-                worker.detector.clearFamilies();
-                worker.detector.addFamily(newParams.tagFamily.getNativeName());
-            }
+            // The single-thread detectors are made again with the new family when they are necessary.
+            releaseParallelWorkers();
             currentFamily = newParams.tagFamily;
         }
 
         detector.setConfig(newParams.detectorConfig);
         detector.setQuadThresholdParameters(newParams.quadParams);
-        configureParallelDetectors(newParams);
+
+        int requestedWorkers =
+                PARALLEL_ROI_WORKERS > 0
+                        ? PARALLEL_ROI_WORKERS
+                        : Math.max(1, newParams.detectorConfig.numThreads);
+        // The calling thread decodes one group, so the pool can serve THREADS more groups.
+        maxParallelWorkers =
+                Math.max(
+                        1, Math.min(requestedWorkers, Math.min(MAX_WORKERS_PER_PIPE, SharedPool.THREADS + 1)));
 
         super.setParams(newParams);
+
+        for (ParallelWorker worker : parallelWorkers) {
+            configureWorker(worker);
+        }
     }
 
     @Override
@@ -739,34 +775,41 @@ public class AprilTagROIDecodePipe
             detector.close();
             detector = null;
         }
+        releaseParallelWorkers();
+    }
+
+    private void releaseParallelWorkers() {
         for (ParallelWorker worker : parallelWorkers) {
             worker.release();
         }
         parallelWorkers.clear();
-        if (parallelExecutor != null) {
-            parallelExecutor.shutdownNow();
-        }
     }
 
-    private void configureParallelDetectors(ROIDecodeParams newParams) {
-        if (parallelWorkers.isEmpty()) {
-            configuredParallelDetectorThreads = 0;
+    /** Returns the worker for a group index. Only the vision thread calls this method. */
+    private ParallelWorker getWorker(int index) {
+        while (parallelWorkers.size() <= index) {
+            ParallelWorker worker = new ParallelWorker();
+            if (currentFamily != null) {
+                worker.detector.addFamily(currentFamily.getNativeName());
+            }
+            configureWorker(worker);
+            parallelWorkers.add(worker);
+        }
+        return parallelWorkers.get(index);
+    }
+
+    /**
+     * Gives a worker detector the same settings as the main detector. Only the thread count is
+     * different. The thread count does not change which quads the detector finds.
+     */
+    private void configureWorker(ParallelWorker worker) {
+        if (params == null) {
             return;
         }
-
-        int workerCount = Math.max(1, parallelWorkers.size());
-        int detectorThreads =
-                PARALLEL_DETECTOR_THREADS > 0
-                        ? PARALLEL_DETECTOR_THREADS
-                        : Math.max(1, newParams.detectorConfig.numThreads / workerCount);
-        configuredParallelDetectorThreads = detectorThreads;
-
-        for (ParallelWorker worker : parallelWorkers) {
-            AprilTagDetector.Config workerConfig = copyConfig(newParams.detectorConfig);
-            workerConfig.numThreads = detectorThreads;
-            worker.detector.setConfig(workerConfig);
-            worker.detector.setQuadThresholdParameters(copyQuadParams(newParams.quadParams));
-        }
+        AprilTagDetector.Config workerConfig = copyConfig(params.detectorConfig);
+        workerConfig.numThreads = PARALLEL_DETECTOR_THREADS;
+        worker.detector.setConfig(workerConfig);
+        worker.detector.setQuadThresholdParameters(copyQuadParams(params.quadParams));
     }
 
     private static AprilTagDetector.Config copyConfig(AprilTagDetector.Config config) {
@@ -793,10 +836,6 @@ public class AprilTagROIDecodePipe
     }
 
     private static class RoiDecodeResult {
-        final List<AprilTagDetection> detections = new ArrayList<>();
-    }
-
-    private static class WorkerDecodeResult {
         final List<AprilTagDetection> detections = new ArrayList<>();
     }
 

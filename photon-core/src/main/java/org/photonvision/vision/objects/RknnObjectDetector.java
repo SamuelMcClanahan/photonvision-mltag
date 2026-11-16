@@ -23,9 +23,11 @@ import java.lang.ref.Cleaner.Cleanable;
 import java.util.List;
 import org.opencv.core.Mat;
 import org.opencv.core.Size;
+import org.opencv.imgproc.Imgproc;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
 import org.photonvision.common.util.ColorHelper;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.rknn.RknnJNI;
 import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
 
@@ -41,12 +43,31 @@ public class RknnObjectDetector implements ObjectDetector {
         return () -> RknnJNI.destroy(ptr);
     }
 
+    /**
+     * Returns the NPU core selection for new detectors. PV_RKNN_CORE_MASK can be: -1 (the runtime
+     * selects a core that is not busy, default), 0, 1 or 2 (one specified core), 10 (cores 0 and 1
+     * together), 210 (all three cores together). This only changes where the model runs. The model
+     * output does not change.
+     */
+    private static int npuCoreSelection() {
+        int requested = EnvUtils.integer("PV_RKNN_CORE_MASK", -1);
+        return switch (requested) {
+            case -1, 0, 1, 2, 10, 210 -> requested;
+            default -> -1;
+        };
+    }
+
     /** Pointer to the native object */
     private final long objPointer;
 
     private final RknnModel model;
 
     private final Size inputSize;
+
+    // Scratch images for the model input. One vision thread uses one detector.
+    private final Mat resizedScratch = new Mat();
+    private final Mat letterboxed = new Mat();
+    private final Mat letterboxedBgr = new Mat();
 
     /** Returns the model in use by this detector. */
     @Override
@@ -71,7 +92,7 @@ public class RknnObjectDetector implements ObjectDetector {
                         model.modelFile.getPath(),
                         model.properties.labels().size(),
                         model.properties.version().ordinal(),
-                        -1);
+                        npuCoreSelection());
         if (objPointer <= 0) {
             throw new RuntimeException(
                     "Failed to create detector from path " + model.modelFile.getPath());
@@ -112,19 +133,26 @@ public class RknnObjectDetector implements ObjectDetector {
             return List.of();
         }
 
-        // Resize the frame to the input size of the model
-        Mat letterboxed = new Mat();
+        // Resize the frame to the input size of the model. The Mats are kept between calls, so
+        // this step does not allocate memory for each frame.
         Letterbox scale =
-                Letterbox.letterbox(in, letterboxed, this.inputSize, ColorHelper.colorToScalar(Color.GRAY));
+                Letterbox.letterbox(
+                        in, resizedScratch, letterboxed, this.inputSize, ColorHelper.colorToScalar(Color.GRAY));
         if (!letterboxed.size().equals(this.inputSize)) {
-            letterboxed.release();
             throw new RuntimeException("Letterboxed frame is not the right size!");
         }
 
-        // Detect objects in the letterboxed frame
-        var results = RknnJNI.detect(objPointer, letterboxed.getNativeObjAddr(), nmsThresh, boxThresh);
+        // A monochrome camera gives a 1-channel image. The model input has 3 channels. Copy the
+        // gray value into each channel after the resize. This gives the same bytes as a resize of
+        // a 3-channel image that has equal channels, and the resize has one third of the work.
+        Mat modelInput = letterboxed;
+        if (letterboxed.channels() == 1) {
+            Imgproc.cvtColor(letterboxed, letterboxedBgr, Imgproc.COLOR_GRAY2BGR);
+            modelInput = letterboxedBgr;
+        }
 
-        letterboxed.release();
+        // Detect objects in the letterboxed frame
+        var results = RknnJNI.detect(objPointer, modelInput.getNativeObjAddr(), nmsThresh, boxThresh);
 
         if (results == null) {
             return List.of();
@@ -140,5 +168,8 @@ public class RknnObjectDetector implements ObjectDetector {
     @Override
     public void release() {
         cleanable.clean();
+        resizedScratch.release();
+        letterboxed.release();
+        letterboxedBgr.release();
     }
 }

@@ -72,4 +72,11 @@ public abstract class FrameProvider implements Supplier<Frame>, Releasable {
 
     /** Ask the camera to block for new frames (true) or use latest available (false) */
     public abstract void requestBlockForFrames(boolean blockForFrames);
+
+    /**
+     * Tell the camera if the active pipeline accepts a 1-channel (monochrome) input image. When this
+     * is false, a provider that captures monochrome images must give a 3-channel BGR image. The
+     * default does nothing, because most providers always give BGR images.
+     */
+    public void requestMonochromeInput(boolean allowed) {}
 }

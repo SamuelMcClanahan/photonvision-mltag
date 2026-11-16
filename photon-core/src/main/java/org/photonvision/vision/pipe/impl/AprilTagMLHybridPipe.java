@@ -19,12 +19,20 @@ package org.photonvision.vision.pipe.impl;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.opencv.core.Point;
 import org.opencv.core.Rect;
 import org.opencv.core.RotatedRect;
 import org.opencv.core.Size;
 import org.photonvision.common.util.EnvUtils;
 import org.photonvision.vision.frame.Frame;
+import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.Releasable;
 import org.photonvision.vision.pipe.CVPipe;
 import org.wpilib.vision.apriltag.AprilTagDetection;
@@ -40,11 +48,31 @@ import org.wpilib.vision.apriltag.AprilTagDetection;
  */
 public class AprilTagMLHybridPipe
         extends CVPipe<Frame, MLDetectionResult, AprilTagMLHybridPipe.Params> implements Releasable {
-    private final AprilTagROIDetectionPipe roiDetectionPipe = new AprilTagROIDetectionPipe();
+    /**
+     * Number of frames that can be in model inference at the same time. Each lane has its own copy of
+     * the model. The default is 1: one frame at a time, on the vision thread.
+     *
+     * <p>More lanes help only when one inference takes longer than one camera frame period (for
+     * example on an NPU that has more than one core). The pipeline then starts the inference of the
+     * next frame while the inference of the last frame continues. Each frame gets the same
+     * processing, so the tag data does not change.
+     */
+    private static final int INFERENCE_LANES =
+            Math.max(1, Math.min(4, EnvUtils.integer("PV_MLTAG_INFERENCE_LANES", 1)));
+
+    private static final AtomicInteger laneThreadNumber = new AtomicInteger();
+
+    private final List<AprilTagROIDetectionPipe> lanePipes = new ArrayList<>();
+    private final BlockingQueue<AprilTagROIDetectionPipe> freeLanes;
+    private final ExecutorService laneExecutor;
     private final AprilTagROIDecodePipe roiDecodePipe = new AprilTagROIDecodePipe();
     private final double roiMergeIouThreshold = EnvUtils.decimal("PV_MLTAG_MERGE_ROI_IOU", 0.0);
     private final double maxRawRoiAreaFraction =
             EnvUtils.decimal("PV_MLTAG_MAX_RAW_ROI_AREA_FRAC", 0.0);
+
+    // Moving average of the inference time of one frame. Written by complete() on the vision thread.
+    private double inferenceNanosAverage = 0;
+    private int inferenceSamples = 0;
 
     public static class Params {
         public final AprilTagROIDetectionPipe.AprilTagROIDetectionParams detectionParams;
@@ -61,25 +89,151 @@ public class AprilTagMLHybridPipe
         }
     }
 
+    /** A frame that is in model inference on a lane. */
+    public static final class PendingDetection {
+        public final Frame frame;
+        private final Future<LaneOutput> future;
+
+        private PendingDetection(Frame frame, Future<LaneOutput> future) {
+            this.frame = frame;
+            this.future = future;
+        }
+
+        /** Waits until the lane does not use the frame. After this the frame can be released. */
+        public void await() {
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException e) {
+                // The frame is not used after a failure.
+            }
+        }
+    }
+
+    /** The output of {@link #complete(PendingDetection)}. */
+    public record CompletedDetection(
+            MLDetectionResult result, long inferenceNanos, long decodeNanos) {
+        public long nanosElapsed() {
+            return inferenceNanos + decodeNanos;
+        }
+    }
+
+    private record LaneOutput(List<RotatedRect> rois, long nanosElapsed) {}
+
+    public AprilTagMLHybridPipe() {
+        this(INFERENCE_LANES);
+    }
+
+    /**
+     * @param lanes Number of frames that can be in model inference at the same time (1 to 4).
+     */
+    public AprilTagMLHybridPipe(int lanes) {
+        int laneCount = Math.max(1, Math.min(4, lanes));
+        for (int i = 0; i < laneCount; i++) {
+            lanePipes.add(new AprilTagROIDetectionPipe());
+        }
+        if (laneCount > 1) {
+            freeLanes = new ArrayBlockingQueue<>(laneCount, false, lanePipes);
+            laneExecutor =
+                    Executors.newFixedThreadPool(
+                            laneCount,
+                            runnable -> {
+                                Thread thread =
+                                        new Thread(runnable, "MLTag-Inference-" + laneThreadNumber.incrementAndGet());
+                                thread.setDaemon(true);
+                                return thread;
+                            });
+        } else {
+            freeLanes = null;
+            laneExecutor = null;
+        }
+    }
+
+    /** Returns the number of frames that can be in model inference at the same time. */
+    public int getLaneCount() {
+        return lanePipes.size();
+    }
+
+    /**
+     * Sets the parameters. The caller must make sure that no frame is in inference (each {@link
+     * PendingDetection} is completed or awaited), because this can load a different model.
+     */
     @Override
     public void setParams(Params newParams) {
-        roiDetectionPipe.setParams(newParams.detectionParams);
+        for (AprilTagROIDetectionPipe lane : lanePipes) {
+            lane.setParams(newParams.detectionParams);
+        }
         roiDecodePipe.setParams(newParams.decodeParams);
         super.setParams(newParams);
     }
 
     @Override
     protected MLDetectionResult process(Frame frame) {
-        int frameWidth = imageWidth(frame);
-        int frameHeight = imageHeight(frame);
+        List<RotatedRect> rawRois = lanePipes.get(0).run(frame.colorImage).output;
+        return decodeStage(frame, rawRois);
+    }
 
-        List<RotatedRect> rawRois;
-        CVPipe.CVPipeResult<List<RotatedRect>> mlResult = roiDetectionPipe.run(frame.colorImage);
-        rawRois = mlResult.output;
+    /**
+     * Starts the model inference of a frame on a free lane and returns immediately. The frame must
+     * stay valid until {@link #complete(PendingDetection)} or {@link PendingDetection#await()}
+     * returns. Only available when the pipe has more than one lane.
+     */
+    public PendingDetection submit(Frame frame) {
+        if (laneExecutor == null) {
+            throw new IllegalStateException("This pipe has one inference lane");
+        }
+        final CVMat image = frame.colorImage;
+        Future<LaneOutput> future =
+                laneExecutor.submit(
+                        () -> {
+                            AprilTagROIDetectionPipe lane = freeLanes.take();
+                            try {
+                                long start = System.nanoTime();
+                                List<RotatedRect> rois = lane.run(image).output;
+                                return new LaneOutput(rois, System.nanoTime() - start);
+                            } finally {
+                                freeLanes.add(lane);
+                            }
+                        });
+        return new PendingDetection(frame, future);
+    }
 
-        if (rawRois.isEmpty()) {
+    /**
+     * Waits for the model inference of a frame, then decodes the tags in the regions that the model
+     * found. This gives the same result as {@link #run(Object)} for that frame.
+     */
+    public CompletedDetection complete(PendingDetection pending)
+            throws InterruptedException, ExecutionException {
+        LaneOutput lane = pending.future.get();
+        inferenceNanosAverage =
+                inferenceSamples == 0
+                        ? lane.nanosElapsed()
+                        : inferenceNanosAverage * 0.9 + lane.nanosElapsed() * 0.1;
+        inferenceSamples++;
+
+        long decodeStart = System.nanoTime();
+        MLDetectionResult result = decodeStage(pending.frame, lane.rois());
+        return new CompletedDetection(result, lane.nanosElapsed(), System.nanoTime() - decodeStart);
+    }
+
+    /** Returns the moving average of the time of one model inference, in nanoseconds. */
+    public double getInferenceNanosAverage() {
+        return inferenceNanosAverage;
+    }
+
+    /** Returns the number of inferences that the average is made from. */
+    public int getInferenceSamples() {
+        return inferenceSamples;
+    }
+
+    private MLDetectionResult decodeStage(Frame frame, List<RotatedRect> rawRois) {
+        if (rawRois == null || rawRois.isEmpty()) {
             return new MLDetectionResult(List.of(), List.of());
         }
+
+        int frameWidth = imageWidth(frame);
+        int frameHeight = imageHeight(frame);
 
         rawRois = filterRawRois(rawRois, frameWidth, frameHeight);
         if (rawRois.isEmpty()) {
@@ -130,16 +284,22 @@ public class AprilTagMLHybridPipe
      * @return true when the ROI detection stage has a loaded model (not {@code NullModel}).
      */
     public boolean isAvailable() {
-        return roiDetectionPipe.isAvailable();
+        return lanePipes.get(0).isAvailable();
     }
 
     @Override
     public void release() {
-        roiDetectionPipe.release();
+        if (laneExecutor != null) {
+            laneExecutor.shutdownNow();
+        }
+        for (AprilTagROIDetectionPipe lane : lanePipes) {
+            lane.release();
+        }
         roiDecodePipe.release();
     }
 
-    private List<RotatedRect> filterRawRois(List<RotatedRect> rawRois, int frameWidth, int frameHeight) {
+    private List<RotatedRect> filterRawRois(
+            List<RotatedRect> rawRois, int frameWidth, int frameHeight) {
         if (maxRawRoiAreaFraction <= 0.0 || rawRois.isEmpty()) {
             return rawRois;
         }

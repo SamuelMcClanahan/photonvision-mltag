@@ -23,10 +23,11 @@ import java.lang.ref.Cleaner.Cleanable;
 import java.util.List;
 import org.opencv.core.Mat;
 import org.opencv.core.Size;
+import org.opencv.imgproc.Imgproc;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
-import org.photonvision.common.util.EnvUtils;
 import org.photonvision.common.util.ColorHelper;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.rubik.RubikJNI;
 import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
@@ -51,6 +52,11 @@ public class RubikObjectDetector implements ObjectDetector {
     private final RubikModel model;
 
     private final Size inputSize;
+
+    // Scratch images for the model input. One vision thread uses one detector.
+    private final Mat resizedScratch = new Mat();
+    private final Mat letterboxed = new Mat();
+    private final Mat letterboxedBgr = new Mat();
 
     /** Returns the model in use by this detector. */
     @Override
@@ -125,19 +131,26 @@ public class RubikObjectDetector implements ObjectDetector {
             return null;
         }
 
-        // Resize the frame to the input size of the model
-        Mat letterboxed = new Mat();
+        // Resize the frame to the input size of the model. The Mats are kept between calls, so
+        // this step does not allocate memory for each frame.
         Letterbox scale =
-                Letterbox.letterbox(in, letterboxed, this.inputSize, ColorHelper.colorToScalar(Color.GRAY));
+                Letterbox.letterbox(
+                        in, resizedScratch, letterboxed, this.inputSize, ColorHelper.colorToScalar(Color.GRAY));
         if (!letterboxed.size().equals(this.inputSize)) {
-            letterboxed.release();
             throw new RuntimeException("Letterboxed frame is not the right size!");
         }
 
-        // Detect objects in the letterboxed frame
-        var results = RubikJNI.detect(ptr, letterboxed.getNativeObjAddr(), boxThresh, nmsThresh);
+        // A monochrome camera gives a 1-channel image. The model input has 3 channels. Copy the
+        // gray value into each channel after the resize. This gives the same bytes as a resize of
+        // a 3-channel image that has equal channels, and the resize has one third of the work.
+        Mat modelInput = letterboxed;
+        if (letterboxed.channels() == 1) {
+            Imgproc.cvtColor(letterboxed, letterboxedBgr, Imgproc.COLOR_GRAY2BGR);
+            modelInput = letterboxedBgr;
+        }
 
-        letterboxed.release();
+        // Detect objects in the letterboxed frame
+        var results = RubikJNI.detect(ptr, modelInput.getNativeObjAddr(), boxThresh, nmsThresh);
 
         if (results == null) {
             return List.of();
@@ -164,6 +177,9 @@ public class RubikObjectDetector implements ObjectDetector {
     @Override
     public void release() {
         cleanable.clean();
+        resizedScratch.release();
+        letterboxed.release();
+        letterboxedBgr.release();
     }
 
     private boolean isValid() {

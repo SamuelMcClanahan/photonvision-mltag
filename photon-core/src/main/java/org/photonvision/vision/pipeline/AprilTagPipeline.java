@@ -17,6 +17,7 @@
 
 package org.photonvision.vision.pipeline;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -68,22 +69,40 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     private final CalculateFPSPipe calculateFPSPipe = new CalculateFPSPipe();
 
     // ML-assisted detection (composite ROI detect + ROI decode)
-    private final AprilTagMLHybridPipe mlHybridPipe = new AprilTagMLHybridPipe();
+    private final AprilTagMLHybridPipe mlHybridPipe;
     private boolean mlAvailable = false;
     private boolean mlWasAvailable = false;
     private boolean pipeParamsConfigured = false;
     private int lastPipeParamsHash = 0;
 
+    // Frames that are in model inference. Only used when the hybrid pipe has more than one lane.
+    private final ArrayDeque<AprilTagMLHybridPipe.PendingDetection> pendingDetections =
+            new ArrayDeque<>();
+    private InferenceOverlapController overlapController;
+
+    /** A pending frame that is older than this is not completed. Its result has no use. */
+    private static final long STALE_PENDING_NANOS = 500_000_000L;
+
     private static final FrameThresholdType PROCESSING_TYPE = FrameThresholdType.GREYSCALE;
 
     public AprilTagPipeline() {
-        super(PROCESSING_TYPE);
-        settings = new AprilTagPipelineSettings();
+        this(new AprilTagPipelineSettings());
     }
 
     public AprilTagPipeline(AprilTagPipelineSettings settings) {
         super(PROCESSING_TYPE);
         this.settings = settings;
+        this.mlHybridPipe = new AprilTagMLHybridPipe();
+    }
+
+    /**
+     * @param settings The pipeline settings.
+     * @param inferenceLanes Number of frames that can be in model inference at the same time.
+     */
+    AprilTagPipeline(AprilTagPipelineSettings settings, int inferenceLanes) {
+        super(PROCESSING_TYPE);
+        this.settings = settings;
+        this.mlHybridPipe = new AprilTagMLHybridPipe(inferenceLanes);
     }
 
     @Override
@@ -103,6 +122,10 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         if (pipeParamsConfigured && pipeParamsHash == lastPipeParamsHash) {
             return;
         }
+
+        // The settings changed. Frames that are in inference use the old model and the old settings.
+        // Wait for them and release them before the pipes get new parameters.
+        discardPendingDetections();
 
         // for now, hard code tag width based on enum value
         // From 2024 best guess is 6.5
@@ -161,10 +184,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             boolean platformOk = checkMLAvailability();
             Model apriltagModel = null;
             if (platformOk) {
-                apriltagModel =
-                        NeuralNetworkModelManager.getInstance()
-                                .getModel(settings.model.modelPath().toString())
-                                .orElse(null);
+                apriltagModel = resolveModel(settings);
             }
 
             if (platformOk && apriltagModel != null) {
@@ -224,13 +244,18 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
 
     @Override
     protected CVPipelineResult process(Frame frame, AprilTagPipelineSettings settings) {
-        long sumPipeNanosElapsed = 0L;
-
         boolean useML = settings.useMLDetection && mlAvailable;
 
         if (!useML && frame.type != FrameThresholdType.GREYSCALE) {
             // We asked for a GREYSCALE frame, but didn't get one -- best we can do is give up
             return new CVPipelineResult(frame.sequenceID, 0, 0, List.of(), frame);
+        }
+
+        if (useML && mlHybridPipe.getLaneCount() > 1) {
+            return processWithInferenceLanes(frame, settings);
+        }
+        if (!pendingDetections.isEmpty()) {
+            discardPendingDetections();
         }
 
         // Perform AprilTag detection (traditional or ML-assisted)
@@ -251,7 +276,115 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             detections = tagDetectionPipeResult.output;
             detectionNanos = tagDetectionPipeResult.nanosElapsed;
         }
-        sumPipeNanosElapsed += detectionNanos;
+
+        return buildResult(frame, settings, detections, detectionNanos, mlDetectionRois);
+    }
+
+    /**
+     * ML detection with more than one frame in model inference at the same time.
+     *
+     * <p>This method starts the inference of the input frame. Then it completes the oldest frame that
+     * is in inference, and returns the result of that frame. The frames are completed in the capture
+     * order, and each frame gets the same processing as in {@link #process}.
+     *
+     * <p>{@link InferenceOverlapController} decides if a call completes its own frame (when the
+     * pipeline is faster than the camera) or an earlier frame (when the model inference is slower
+     * than the camera frame period).
+     *
+     * @return The result of the oldest frame, or null if no frame is complete.
+     */
+    private CVPipelineResult processWithInferenceLanes(
+            Frame frame, AprilTagPipelineSettings settings) {
+        if (overlapController == null) {
+            overlapController = new InferenceOverlapController(mlHybridPipe.getLaneCount());
+        }
+        discardStalePendingDetections(frame.timestampNanos);
+
+        var action =
+                overlapController.onFrame(
+                        System.nanoTime(),
+                        frame.timestampNanos,
+                        pendingDetections.size(),
+                        mlHybridPipe.getInferenceNanosAverage(),
+                        mlHybridPipe.getInferenceSamples());
+
+        if (action == InferenceOverlapController.Action.SKIP_INPUT && !pendingDetections.isEmpty()) {
+            // The pipeline goes back to one frame at a time. This call must complete an earlier
+            // frame, so it cannot also complete the input frame.
+            frame.release();
+        } else {
+            pendingDetections.addLast(mlHybridPipe.submit(frame));
+            if (action == InferenceOverlapController.Action.DEFER) {
+                overlapController.onCallEnd(System.nanoTime(), -1);
+                return null;
+            }
+        }
+
+        var pending = pendingDetections.removeFirst();
+        CVPipelineResult result;
+        long postInferenceNanos = -1;
+        try {
+            var completed = mlHybridPipe.complete(pending);
+            long buildStart = System.nanoTime();
+            result =
+                    buildResult(
+                            pending.frame,
+                            settings,
+                            completed.result().detections(),
+                            completed.nanosElapsed(),
+                            completed.result().rois());
+            postInferenceNanos = completed.decodeNanos() + System.nanoTime() - buildStart;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            pending.await();
+            result = new CVPipelineResult(pending.frame.sequenceID, 0, 0, List.of(), pending.frame);
+        } catch (Exception e) {
+            logger.error("ML AprilTag inference failed", e);
+            result = new CVPipelineResult(pending.frame.sequenceID, 0, 0, List.of(), pending.frame);
+        }
+        overlapController.onCallEnd(System.nanoTime(), postInferenceNanos);
+        return result;
+    }
+
+    /** Releases pending frames that are too old, for example after this pipeline was not active. */
+    private void discardStalePendingDetections(long newestTimestampNanos) {
+        boolean discarded = false;
+        while (!pendingDetections.isEmpty()
+                && newestTimestampNanos - pendingDetections.peekFirst().frame.timestampNanos
+                        > STALE_PENDING_NANOS) {
+            var stale = pendingDetections.removeFirst();
+            stale.await();
+            stale.frame.release();
+            discarded = true;
+        }
+        if (discarded && overlapController != null) {
+            overlapController.reset();
+        }
+    }
+
+    private void discardPendingDetections() {
+        while (!pendingDetections.isEmpty()) {
+            var pending = pendingDetections.removeFirst();
+            pending.await();
+            pending.frame.release();
+        }
+        if (overlapController != null) {
+            overlapController.reset();
+        }
+    }
+
+    /**
+     * Filters the detections, estimates the poses and makes the pipeline result for one frame.
+     *
+     * @param frame The frame that the detections are from.
+     */
+    private CVPipelineResult buildResult(
+            Frame frame,
+            AprilTagPipelineSettings settings,
+            List<AprilTagDetection> detections,
+            long detectionNanos,
+            List<RotatedRect> mlDetectionRois) {
+        long sumPipeNanosElapsed = detectionNanos;
 
         List<AprilTagDetection> usedDetections = new ArrayList<>();
         List<TrackedTarget> targetList = new ArrayList<>();
@@ -370,15 +503,26 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
      * Checks if ML detection is available on the current platform. Currently supported: RK3588
      * (Orange Pi 5, Rock 5C, CoolPi 4B), QCS6490 (Rubik Pi 3), and NVIDIA Jetson via TensorRT.
      */
-    private boolean checkMLAvailability() {
+    protected boolean checkMLAvailability() {
         Platform platform = Platform.getCurrentPlatform();
         return platform == Platform.LINUX_QCS6490
                 || platform == Platform.LINUX_RK3588_64
                 || Platform.isJetson();
     }
 
+    /** Returns the model that the settings select, or null if it is not available. */
+    protected Model resolveModel(AprilTagPipelineSettings settings) {
+        if (settings.model == null) {
+            return null;
+        }
+        return NeuralNetworkModelManager.getInstance()
+                .getModel(settings.model.modelPath().toString())
+                .orElse(null);
+    }
+
     @Override
     public void release() {
+        discardPendingDetections();
         aprilTagDetectionPipe.release();
         singleTagPoseEstimatorPipe.release();
         mlHybridPipe.release();

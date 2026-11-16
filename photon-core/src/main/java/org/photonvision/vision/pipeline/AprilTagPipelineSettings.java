@@ -95,7 +95,9 @@ public class AprilTagPipelineSettings extends AdvancedPipelineSettings {
         temp = Double.doubleToLongBits(mlNmsThreshold);
         result = prime * result + (int) (temp ^ (temp >>> 32));
         result = prime * result + mlRoiPaddingPixels;
-        result = prime * result + ((model.modelPath() == null) ? 0 : model.modelPath().hashCode());
+        result =
+                prime * result
+                        + ((model == null || model.modelPath() == null) ? 0 : model.modelPath().hashCode());
         result = prime * result + (showDetectionBoxes ? 1231 : 1237);
         // ATR fields
         result = prime * result + (atrEnabled ? 1231 : 1237);

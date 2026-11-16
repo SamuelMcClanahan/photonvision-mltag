@@ -79,7 +79,17 @@ public abstract class CVPipeline<R extends CVPipelineResult, S extends CVPipelin
         // }
         R result = process(frame, settings);
 
-        result.setImageCaptureTimestampNanos(frame.timestampNanos);
+        // A pipeline that keeps several frames in work at the same time (see AprilTagPipeline) can
+        // give no result for this call. The frame stays with the pipeline, and its result comes
+        // with a later call.
+        if (result == null) {
+            return null;
+        }
+
+        // The result can be for an earlier frame than the input frame of this call. The capture
+        // time must always be the capture time of the frame that the result is for.
+        Frame resultFrame = result.inputAndOutputFrame != null ? result.inputAndOutputFrame : frame;
+        result.setImageCaptureTimestampNanos(resultFrame.timestampNanos);
 
         return result;
     }

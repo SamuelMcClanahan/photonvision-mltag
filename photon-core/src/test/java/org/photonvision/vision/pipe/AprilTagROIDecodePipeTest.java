@@ -37,6 +37,7 @@ import org.photonvision.common.LoadJNI;
 import org.photonvision.common.configuration.ConfigManager;
 import org.photonvision.common.util.TestUtils;
 import org.photonvision.vision.apriltag.AprilTagFamily;
+import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.frame.provider.FileFrameProvider;
 import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.pipe.impl.AprilTagROIDecodePipe;
@@ -75,12 +76,15 @@ public class AprilTagROIDecodePipeTest {
                         TestUtils.WPI2020Image.FOV,
                         TestUtils.get2020LifeCamCoeffs(false));
 
+        frameProvider.requestFrameThresholdType(FrameThresholdType.GREYSCALE);
         var frame = frameProvider.get();
         Mat grayMat = frame.processedImage.getMat();
 
         // First, run full-frame detection to get ground truth corners
         AprilTagDetector fullFrameDetector = new AprilTagDetector();
         fullFrameDetector.addFamily(AprilTagFamily.kTag36h11.getNativeName());
+        // Use the quad settings of the AprilTag pipeline. The WPILib defaults do not find this tag.
+        fullFrameDetector.setQuadThresholdParameters(new ROIDecodeParams().quadParams);
 
         AprilTagDetection[] fullFrameDetections;
         try {
@@ -202,6 +206,7 @@ public class AprilTagROIDecodePipeTest {
                         TestUtils.WPI2020Image.FOV,
                         TestUtils.get2020LifeCamCoeffs(false));
 
+        frameProvider.requestFrameThresholdType(FrameThresholdType.GREYSCALE);
         var frame = frameProvider.get();
 
         AprilTagROIDecodePipe decodePipe = new AprilTagROIDecodePipe();
@@ -593,12 +598,15 @@ public class AprilTagROIDecodePipeTest {
                         TestUtils.WPI2020Image.FOV,
                         TestUtils.get2020LifeCamCoeffs(false));
 
+        frameProvider.requestFrameThresholdType(FrameThresholdType.GREYSCALE);
         var frame = frameProvider.get();
         Mat grayMat = frame.processedImage.getMat();
 
         // First, run full-frame detection to get ground truth
         AprilTagDetector fullFrameDetector = new AprilTagDetector();
         fullFrameDetector.addFamily(AprilTagFamily.kTag36h11.getNativeName());
+        // Use the quad settings of the AprilTag pipeline. The WPILib defaults do not find this tag.
+        fullFrameDetector.setQuadThresholdParameters(new ROIDecodeParams().quadParams);
 
         AprilTagDetection[] fullFrameDetections;
         try {
@@ -884,12 +892,15 @@ public class AprilTagROIDecodePipeTest {
                         TestUtils.WPI2020Image.FOV,
                         TestUtils.get2020LifeCamCoeffs(false));
 
+        frameProvider.requestFrameThresholdType(FrameThresholdType.GREYSCALE);
         var frame = frameProvider.get();
         Mat grayMat = frame.processedImage.getMat();
 
         // First, run full-frame detection to find the tag location
         AprilTagDetector fullFrameDetector = new AprilTagDetector();
         fullFrameDetector.addFamily(AprilTagFamily.kTag36h11.getNativeName());
+        // Use the quad settings of the AprilTag pipeline. The WPILib defaults do not find this tag.
+        fullFrameDetector.setQuadThresholdParameters(new ROIDecodeParams().quadParams);
 
         AprilTagDetection[] fullFrameDetections;
         try {

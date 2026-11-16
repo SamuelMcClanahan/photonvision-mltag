@@ -52,16 +52,40 @@ public class Letterbox {
      * @return
      */
     public static Letterbox letterbox(Mat frame, Mat letterboxed, Size newShape, Scalar color) {
+        Mat resized = new Mat();
+        try {
+            return letterbox(frame, resized, letterboxed, newShape, color);
+        } finally {
+            resized.release();
+        }
+    }
+
+    /**
+     * Resize the frame to the new shape and "letterbox" it. This variant uses a scratch Mat from the
+     * caller, so a caller that keeps both Mats does not allocate memory for each frame. The pixel
+     * values are the same as the values from {@link #letterbox(Mat, Mat, Size, Scalar)}.
+     *
+     * @param frame The input image. It can have 1 or 3 channels.
+     * @param resizedScratch Scratch Mat for the resized image. It must not be {@code letterboxed}.
+     * @param letterboxed The output image. It has the channel count of {@code frame}.
+     * @param newShape The output size.
+     * @param color The padding color.
+     * @return The transform from letterboxed coordinates to frame coordinates.
+     */
+    public static Letterbox letterbox(
+            Mat frame, Mat resizedScratch, Mat letterboxed, Size newShape, Scalar color) {
         // from https://github.com/ultralytics/yolov5/issues/8427#issuecomment-1172469631
         var frameSize = frame.size();
         var r = Math.min(newShape.height / frameSize.height, newShape.width / frameSize.width);
 
         var newUnpad = new Size(Math.round(frameSize.width * r), Math.round(frameSize.height * r));
 
+        Mat unpadded;
         if (!(frameSize.equals(newUnpad))) {
-            Imgproc.resize(frame, letterboxed, newUnpad, Imgproc.INTER_LINEAR);
+            Imgproc.resize(frame, resizedScratch, newUnpad, Imgproc.INTER_LINEAR);
+            unpadded = resizedScratch;
         } else {
-            frame.copyTo(letterboxed);
+            unpadded = frame;
         }
 
         var dw = newShape.width - newUnpad.width;
@@ -75,7 +99,7 @@ public class Letterbox {
         int left = (int) (Math.round(dw - 0.1f));
         int right = (int) (Math.round(dw + 0.1f));
         Core.copyMakeBorder(
-                letterboxed, letterboxed, top, bottom, left, right, Core.BORDER_CONSTANT, color);
+                unpadded, letterboxed, top, bottom, left, right, Core.BORDER_CONSTANT, color);
 
         return new Letterbox(dw, dh, r);
     }

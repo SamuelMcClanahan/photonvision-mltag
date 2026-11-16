@@ -39,6 +39,7 @@ import org.photonvision.vision.frame.FrameProvider;
 import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.pipe.impl.HSVPipe;
 import org.photonvision.vision.pipeline.AdvancedPipelineSettings;
+import org.photonvision.vision.pipeline.AprilTagPipeline;
 import org.photonvision.vision.pipeline.AprilTagPipelineSettings;
 import org.photonvision.vision.pipeline.CVPipeline;
 import org.photonvision.vision.pipeline.StreamDemand;
@@ -242,6 +243,8 @@ public class VisionRunner {
             frameSupplier.requestFrameCopies(
                     streamDemand.effectiveInput(settings), streamDemand.effectiveOutput(settings));
             frameSupplier.requestBlockForFrames(settings.blockForFrames);
+            // Only the AprilTag pipeline is known to accept a 1-channel input image.
+            frameSupplier.requestMonochromeInput(pipeline instanceof AprilTagPipeline);
             long setupNanos = System.nanoTime() - setupStartNanos;
 
             // Grab the new camera frame
@@ -278,7 +281,22 @@ public class VisionRunner {
                     long pipelineRunStartNanos = System.nanoTime();
                     var pipelineResult = pipeline.run(frame, cameraQuirks);
                     long pipelineRunNanos = System.nanoTime() - pipelineRunStartNanos;
+                    if (pipelineResult == null) {
+                        // The pipeline keeps this frame and gives its result with a later call.
+                        loopCount++;
+                        continue;
+                    }
                     long pipelineDoneNanos = MathUtils.wpiNanoTime();
+                    // The result can be for an earlier frame than the frame of this loop.
+                    Frame resultFrame =
+                            pipelineResult.inputAndOutputFrame != null
+                                    ? pipelineResult.inputAndOutputFrame
+                                    : frame;
+                    long resultFrameTimestampNanos = resultFrame.timestampNanos;
+                    long resultEstimatedAgeNanos =
+                            resultFrame.captureMetadata != null
+                                    ? resultFrame.captureMetadata.estimatedAgeNanos()
+                                    : -1;
                     long resultConsumerStartNanos = System.nanoTime();
                     pipelineResultConsumer.accept(pipelineResult);
                     long resultConsumerNanos = System.nanoTime() - resultConsumerStartNanos;
@@ -288,7 +306,8 @@ public class VisionRunner {
                             frameGetNanos,
                             pipelineRunNanos,
                             resultConsumerNanos,
-                            frame,
+                            resultFrameTimestampNanos,
+                            resultEstimatedAgeNanos,
                             pipelineDoneNanos,
                             consumerDoneNanos);
                 } catch (Exception ex) {
@@ -304,7 +323,8 @@ public class VisionRunner {
             long frameGetNanos,
             long pipelineRunNanos,
             long resultConsumerNanos,
-            Frame frame,
+            long frameTimestampNanos,
+            long frameEstimatedAgeNanos,
             long pipelineDoneNanos,
             long consumerDoneNanos) {
         if (TIMING_LOG_EVERY <= 0) {
@@ -316,14 +336,12 @@ public class VisionRunner {
         timingFrameGetNanos += frameGetNanos;
         timingPipelineRunNanos += pipelineRunNanos;
         timingResultConsumerNanos += resultConsumerNanos;
-        if (frame != null && frame.timestampNanos > 0) {
-            timingCaptureToPipelineDoneNanos += Math.max(0, pipelineDoneNanos - frame.timestampNanos);
-            timingCaptureToConsumerDoneNanos += Math.max(0, consumerDoneNanos - frame.timestampNanos);
+        if (frameTimestampNanos > 0) {
+            timingCaptureToPipelineDoneNanos += Math.max(0, pipelineDoneNanos - frameTimestampNanos);
+            timingCaptureToConsumerDoneNanos += Math.max(0, consumerDoneNanos - frameTimestampNanos);
         }
-        if (frame != null
-                && frame.captureMetadata != null
-                && frame.captureMetadata.estimatedAgeNanos() >= 0) {
-            timingGStreamerEstimatedAgeNanos += frame.captureMetadata.estimatedAgeNanos();
+        if (frameEstimatedAgeNanos >= 0) {
+            timingGStreamerEstimatedAgeNanos += frameEstimatedAgeNanos;
             timingGStreamerEstimatedAgeSamples++;
         }
 

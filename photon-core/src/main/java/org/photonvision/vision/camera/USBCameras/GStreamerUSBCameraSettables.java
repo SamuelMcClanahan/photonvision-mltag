@@ -180,6 +180,8 @@ public class GStreamerUSBCameraSettables extends VisionSourceSettables {
                 EnvUtils.string("PV_USB_GSTREAMER_PIXEL_FORMAT", "MJPEG").toUpperCase(Locale.ROOT);
         return switch (normalized) {
             case "YUYV", "YUY2" -> PixelFormat.kYUYV;
+            case "UYVY" -> PixelFormat.kUYVY;
+            case "GRAY", "GREY", "GRAY8", "Y8", "Y800" -> PixelFormat.kGray;
             case "MJPEG", "MJPG" -> PixelFormat.kMJPEG;
             default -> PixelFormat.kMJPEG;
         };
