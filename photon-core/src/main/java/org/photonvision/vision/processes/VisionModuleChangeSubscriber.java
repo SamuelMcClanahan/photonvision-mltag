@@ -61,8 +61,9 @@ public class VisionModuleChangeSubscriber extends DataChangeSubscriber {
         // Camera index -1 means a "multicast event" (i.e. the event is received by all
         // cameras)
         if (event instanceof IncomingWebSocketEvent wsEvent
-                && wsEvent.cameraUniqueName != null
-                && wsEvent.cameraUniqueName.equals(parentModule.uniqueName())) {
+                && (("streamDemand".equals(wsEvent.propertyName) && wsEvent.cameraUniqueName == null)
+                        || (wsEvent.cameraUniqueName != null
+                                && wsEvent.cameraUniqueName.equals(parentModule.uniqueName())))) {
             logger.trace("Got PSC event - propName: " + wsEvent.propertyName);
             changeListLock.lock();
             try {
@@ -101,6 +102,8 @@ public class VisionModuleChangeSubscriber extends DataChangeSubscriber {
                     case "saveInputSnapshot" -> parentModule.saveInputSnapshot();
                     case "saveOutputSnapshot" -> parentModule.saveOutputSnapshot();
                     case "takeCalSnapshot" -> parentModule.takeCalibrationSnapshot();
+                    case "streamDemand" ->
+                            parentModule.updateStreamDemand((Map<String, Object>) newPropValue, originContext);
                     case "duplicatePipeline" -> duplicatePipeline((Integer) newPropValue);
                     case "calibrationUploaded" -> {
                         if (newPropValue instanceof CameraCalibrationCoefficients newCal) {

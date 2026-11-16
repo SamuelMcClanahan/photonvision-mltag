@@ -21,6 +21,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.opencv.core.Mat;
 import org.opencv.core.Point;
 import org.opencv.core.Rect;
@@ -29,6 +32,7 @@ import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.vision.apriltag.AprilTagFamily;
 import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.Releasable;
@@ -52,7 +56,16 @@ public class AprilTagROIDecodePipe
         implements Releasable {
     private static final Logger logger =
             new Logger(AprilTagROIDecodePipe.class, LogGroup.VisionModule);
-    private static final boolean DEBUG_COORDINATE_MAPPING = false;
+    private static final boolean PARALLEL_ROI_DECODE = EnvUtils.flag("PV_MLTAG_PARALLEL_ROI_DECODE");
+    private static final int PARALLEL_ROI_WORKERS =
+            Math.max(1, EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_WORKERS", 2));
+    private static final int PARALLEL_DETECTOR_THREADS =
+            EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_DETECTOR_THREADS", 0);
+    private static final int PARALLEL_ROI_MIN_COUNT =
+            Math.max(2, EnvUtils.integer("PV_MLTAG_PARALLEL_ROI_MIN_COUNT", 2));
+    private static final boolean CONTIGUOUS_ROI_COPY = EnvUtils.flag("PV_MLTAG_CONTIGUOUS_ROI_COPY");
+    private static final boolean AREA_BALANCED_PARALLEL_ROIS =
+            EnvUtils.flag("PV_MLTAG_AREA_BALANCED_ROI_DECODE");
 
     /** Context object containing ATR scaling information for a single ROI. */
     private static class ATRContext {
@@ -115,149 +128,356 @@ public class AprilTagROIDecodePipe
 
     private AprilTagDetector detector;
     private AprilTagFamily currentFamily;
+    private final Mat resizedRoi = new Mat();
+    private final Mat grayRoi = new Mat();
+    private final Mat contiguousRoi = new Mat();
+    private final ExecutorService parallelExecutor;
+    private final List<ParallelWorker> parallelWorkers = new ArrayList<>();
+    private int configuredParallelDetectorThreads = 0;
 
     public AprilTagROIDecodePipe() {
         detector = new AprilTagDetector();
+        if (PARALLEL_ROI_DECODE && PARALLEL_ROI_WORKERS > 1) {
+            parallelExecutor =
+                    Executors.newFixedThreadPool(
+                            PARALLEL_ROI_WORKERS,
+                            runnable -> {
+                                Thread thread = new Thread(runnable, "AprilTag-ROI-Decode");
+                                thread.setDaemon(true);
+                                return thread;
+                            });
+            for (int i = 0; i < PARALLEL_ROI_WORKERS; i++) {
+                parallelWorkers.add(new ParallelWorker());
+            }
+        } else {
+            parallelExecutor = null;
+        }
     }
 
     @Override
     protected List<AprilTagDetection> process(ROIDecodeInput input) {
-        List<AprilTagDetection> allDetections = new ArrayList<>();
-
-        if (input.grayFrame == null || input.grayFrame.getMat().empty()) {
-            return allDetections;
+        if (input.grayFrame == null
+                || input.grayFrame.getMat().empty()
+                || input.rois == null
+                || input.rois.isEmpty()) {
+            return List.of();
         }
 
         Mat fullFrame = input.grayFrame.getMat();
         int frameWidth = fullFrame.cols();
         int frameHeight = fullFrame.rows();
 
-        for (RotatedRect roi : input.rois) {
-            // ROIs are already expanded by the caller (AprilTagMLHybridPipe)
-            Rect roiRect = toIntRect(roi);
-
-            if (roiRect.width <= 0 || roiRect.height <= 0) {
-                continue;
-            }
-
-            // Clamp to frame bounds (defensive)
-            roiRect = clampToFrame(roiRect, frameWidth, frameHeight);
-            if (roiRect.width <= 0 || roiRect.height <= 0) {
-                continue;
-            }
-
-            if (DEBUG_COORDINATE_MAPPING) {
-                logger.debug(
-                        "Original ROI: center=("
-                                + roi.center.x
-                                + ", "
-                                + roi.center.y
-                                + "), size="
-                                + roi.size.width
-                                + "x"
-                                + roi.size.height
-                                + ", angle="
-                                + roi.angle);
-                logger.debug(
-                        "Expanded ROI (used for mapping): x="
-                                + roiRect.x
-                                + ", y="
-                                + roiRect.y
-                                + ", w="
-                                + roiRect.width
-                                + ", h="
-                                + roiRect.height);
-            }
-
-            // Extract full-resolution submat
-            Mat roiMat = fullFrame.submat(roiRect);
-
-            // === STAGE 1: COARSE - Calculate scaling and resize ===
-            ATRContext atrContext;
-            Mat processingMat;
-
-            if (params.atrEnabled && roiRect.width > params.atrTargetDimension) {
-                // Calculate scale factor: S = min(1.0, T_dim / w)
-                double S = (double) params.atrTargetDimension / roiRect.width;
-                S = Math.max(S, params.atrMinScaleFactor); // Clamp to prevent extreme scaling
-
-                int scaledWidth = (int) Math.round(roiRect.width * S);
-                int scaledHeight = (int) Math.round(roiRect.height * S);
-
-                atrContext = new ATRContext(S);
-
-                // Downscale ROI to target dimension
-                processingMat = new Mat();
-                Imgproc.resize(
-                        roiMat,
-                        processingMat,
-                        new Size(scaledWidth, scaledHeight),
-                        0,
-                        0,
-                        Imgproc.INTER_AREA); // INTER_AREA best for downscaling
-
-                if (DEBUG_COORDINATE_MAPPING) {
-                    logger.debug(
-                            "ATR: ROI "
-                                    + roiRect.width
-                                    + "x"
-                                    + roiRect.height
-                                    + " -> "
-                                    + scaledWidth
-                                    + "x"
-                                    + scaledHeight
-                                    + " (S="
-                                    + S
-                                    + ")");
-                }
-            } else {
-                // No scaling needed (tag already small or ATR disabled)
-                atrContext = ATRContext.noScaling();
-                processingMat = roiMat;
-            }
-
-            // Run AprilTag detection on (possibly scaled) image
-            AprilTagDetection[] roiDetections = detector.detect(processingMat);
-
-            for (AprilTagDetection det : roiDetections) {
-                if (det.getHamming() > params.maxHammingDistance) continue;
-                if (det.getDecisionMargin() < params.minDecisionMargin) continue;
-
-                // === STAGE 2: PROJECTION - Map coordinates back to full-frame ===
-                AprilTagDetection mappedDetection;
-                if (atrContext.wasScaled) {
-                    mappedDetection = mapToFullFrameWithATR(det, roiRect, atrContext);
-                } else {
-                    mappedDetection = mapToFullFrame(det, roiRect);
-                }
-
-                if (DEBUG_COORDINATE_MAPPING) {
-                    logger.debug(
-                            "Tag "
-                                    + det.getId()
-                                    + " corner 0: ROI=("
-                                    + det.getCornerX(0)
-                                    + ", "
-                                    + det.getCornerY(0)
-                                    + "), Full=("
-                                    + mappedDetection.getCornerX(0)
-                                    + ", "
-                                    + mappedDetection.getCornerY(0)
-                                    + ")");
-                }
-
-                allDetections.add(mappedDetection);
-            }
-
-            // Cleanup
-            roiMat.release();
-            if (atrContext.wasScaled) {
-                processingMat.release();
-            }
+        if (isParallelDecodeActive(input.rois.size())) {
+            return processParallel(input.rois, fullFrame, frameWidth, frameHeight);
         }
 
-        // === STAGE 4: POSE ESTIMATION happens in AprilTagPoseEstimatorPipe ===
+        return processSerial(input.rois, fullFrame, frameWidth, frameHeight);
+    }
+
+    private List<AprilTagDetection> processSerial(
+            List<RotatedRect> rois, Mat fullFrame, int frameWidth, int frameHeight) {
+        List<AprilTagDetection> allDetections = new ArrayList<>();
+        for (RotatedRect roi : rois) {
+            RoiDecodeResult roiResult =
+                    decodeOneRoi(
+                            roi,
+                            fullFrame,
+                            frameWidth,
+                            frameHeight,
+                            detector,
+                            grayRoi,
+                            resizedRoi,
+                            contiguousRoi);
+            allDetections.addAll(roiResult.detections);
+        }
+
         return deduplicateByTagId(allDetections);
+    }
+
+    private boolean isParallelDecodeActive(int roiCount) {
+        return PARALLEL_ROI_DECODE
+                && parallelExecutor != null
+                && parallelWorkers.size() > 1
+                && roiCount >= PARALLEL_ROI_MIN_COUNT;
+    }
+
+    private List<AprilTagDetection> processParallel(
+            List<RotatedRect> rois, Mat fullFrame, int frameWidth, int frameHeight) {
+        int workerCount = Math.min(parallelWorkers.size(), rois.size());
+        if (AREA_BALANCED_PARALLEL_ROIS && rois.size() > workerCount) {
+            return processParallelBalanced(rois, fullFrame, frameWidth, frameHeight, workerCount);
+        }
+
+        List<Future<WorkerDecodeResult>> futures = new ArrayList<>(Math.max(0, workerCount - 1));
+
+        for (int workerIndex = 1; workerIndex < workerCount; workerIndex++) {
+            final int startIndex = workerIndex;
+            final ParallelWorker worker = parallelWorkers.get(workerIndex);
+            futures.add(
+                    parallelExecutor.submit(
+                            () ->
+                                    decodeWorkerRois(
+                                            rois, startIndex, workerCount, fullFrame, frameWidth, frameHeight, worker)));
+        }
+
+        List<AprilTagDetection> allDetections = new ArrayList<>();
+        try {
+            WorkerDecodeResult callerResult =
+                    decodeWorkerRois(
+                            rois, 0, workerCount, fullFrame, frameWidth, frameHeight, parallelWorkers.get(0));
+            allDetections.addAll(callerResult.detections);
+
+            for (Future<WorkerDecodeResult> future : futures) {
+                WorkerDecodeResult workerResult = future.get();
+                allDetections.addAll(workerResult.detections);
+            }
+        } catch (Exception e) {
+            logger.warn("Parallel ROI decode failed, falling back to serial decode: " + e.getMessage());
+            return processSerial(rois, fullFrame, frameWidth, frameHeight);
+        }
+
+        return deduplicateByTagId(allDetections);
+    }
+
+    private List<AprilTagDetection> processParallelBalanced(
+            List<RotatedRect> rois, Mat fullFrame, int frameWidth, int frameHeight, int workerCount) {
+        List<List<RotatedRect>> assignments = new ArrayList<>(workerCount);
+        long[] assignmentPixels = new long[workerCount];
+        for (int i = 0; i < workerCount; i++) {
+            assignments.add(new ArrayList<>());
+        }
+
+        List<RotatedRect> sortedRois = new ArrayList<>(rois);
+        sortedRois.sort(
+                (a, b) ->
+                        Long.compare(
+                                roiPixelArea(b, frameWidth, frameHeight),
+                                roiPixelArea(a, frameWidth, frameHeight)));
+        for (RotatedRect roi : sortedRois) {
+            int lightestWorker = 0;
+            for (int i = 1; i < workerCount; i++) {
+                if (assignmentPixels[i] < assignmentPixels[lightestWorker]) {
+                    lightestWorker = i;
+                }
+            }
+            assignments.get(lightestWorker).add(roi);
+            assignmentPixels[lightestWorker] += roiPixelArea(roi, frameWidth, frameHeight);
+        }
+
+        List<Future<WorkerDecodeResult>> futures = new ArrayList<>(Math.max(0, workerCount - 1));
+        for (int workerIndex = 1; workerIndex < workerCount; workerIndex++) {
+            final List<RotatedRect> workerRois = assignments.get(workerIndex);
+            final ParallelWorker worker = parallelWorkers.get(workerIndex);
+            futures.add(
+                    parallelExecutor.submit(
+                            () -> decodeWorkerRoiList(workerRois, fullFrame, frameWidth, frameHeight, worker)));
+        }
+
+        List<AprilTagDetection> allDetections = new ArrayList<>();
+        try {
+            WorkerDecodeResult callerResult =
+                    decodeWorkerRoiList(
+                            assignments.get(0), fullFrame, frameWidth, frameHeight, parallelWorkers.get(0));
+            allDetections.addAll(callerResult.detections);
+
+            for (Future<WorkerDecodeResult> future : futures) {
+                WorkerDecodeResult workerResult = future.get();
+                allDetections.addAll(workerResult.detections);
+            }
+        } catch (Exception e) {
+            logger.warn(
+                    "Balanced parallel ROI decode failed, falling back to serial decode: " + e.getMessage());
+            return processSerial(rois, fullFrame, frameWidth, frameHeight);
+        }
+
+        return deduplicateByTagId(allDetections);
+    }
+
+    private WorkerDecodeResult decodeWorkerRois(
+            List<RotatedRect> rois,
+            int startIndex,
+            int stride,
+            Mat fullFrame,
+            int frameWidth,
+            int frameHeight,
+            ParallelWorker worker) {
+        WorkerDecodeResult workerResult = new WorkerDecodeResult();
+        for (int i = startIndex; i < rois.size(); i += stride) {
+            RoiDecodeResult roiResult =
+                    decodeOneRoi(
+                            rois.get(i),
+                            fullFrame,
+                            frameWidth,
+                            frameHeight,
+                            worker.detector,
+                            worker.grayRoi,
+                            worker.resizedRoi,
+                            worker.contiguousRoi);
+            workerResult.detections.addAll(roiResult.detections);
+        }
+        return workerResult;
+    }
+
+    private WorkerDecodeResult decodeWorkerRoiList(
+            List<RotatedRect> rois,
+            Mat fullFrame,
+            int frameWidth,
+            int frameHeight,
+            ParallelWorker worker) {
+        WorkerDecodeResult workerResult = new WorkerDecodeResult();
+        for (RotatedRect roi : rois) {
+            RoiDecodeResult roiResult =
+                    decodeOneRoi(
+                            roi,
+                            fullFrame,
+                            frameWidth,
+                            frameHeight,
+                            worker.detector,
+                            worker.grayRoi,
+                            worker.resizedRoi,
+                            worker.contiguousRoi);
+            workerResult.detections.addAll(roiResult.detections);
+        }
+        return workerResult;
+    }
+
+    private RoiDecodeResult decodeOneRoi(
+            RotatedRect roi,
+            Mat fullFrame,
+            int frameWidth,
+            int frameHeight,
+            AprilTagDetector activeDetector,
+            Mat grayScratch,
+            Mat resizeScratch,
+            Mat contiguousScratch) {
+        RoiDecodeResult result = new RoiDecodeResult();
+
+        // ROIs are already expanded by the caller (AprilTagMLHybridPipe)
+        Rect roiRect = toIntRect(roi);
+
+        if (roiRect.width <= 0 || roiRect.height <= 0) {
+            return result;
+        }
+
+        // Clamp to frame bounds (defensive)
+        roiRect = clampToFrame(roiRect, frameWidth, frameHeight);
+        if (roiRect.width <= 0 || roiRect.height <= 0) {
+            return result;
+        }
+
+        // Extract full-resolution submat
+        Mat roiMat = fullFrame.submat(roiRect);
+        try {
+            return decodeOneCroppedRoi(
+                    roiRect,
+                    roiMat,
+                    frameWidth,
+                    frameHeight,
+                    activeDetector,
+                    grayScratch,
+                    resizeScratch,
+                    contiguousScratch,
+                    result);
+        } finally {
+            roiMat.release();
+        }
+    }
+
+    private RoiDecodeResult decodeOneCroppedRoi(
+            Rect roiRect,
+            Mat roiMat,
+            int frameWidth,
+            int frameHeight,
+            AprilTagDetector activeDetector,
+            Mat grayScratch,
+            Mat resizeScratch,
+            Mat contiguousScratch) {
+        RoiDecodeResult result = new RoiDecodeResult();
+        roiRect = clampToFrame(roiRect, frameWidth, frameHeight);
+        if (roiRect.width <= 0 || roiRect.height <= 0 || roiMat.empty()) {
+            return result;
+        }
+        return decodeOneCroppedRoi(
+                roiRect,
+                roiMat,
+                frameWidth,
+                frameHeight,
+                activeDetector,
+                grayScratch,
+                resizeScratch,
+                contiguousScratch,
+                result);
+    }
+
+    private RoiDecodeResult decodeOneCroppedRoi(
+            Rect roiRect,
+            Mat roiMat,
+            int frameWidth,
+            int frameHeight,
+            AprilTagDetector activeDetector,
+            Mat grayScratch,
+            Mat resizeScratch,
+            Mat contiguousScratch,
+            RoiDecodeResult result) {
+        Mat decodeRoiMat = roiMat;
+        if (roiMat.channels() > 1) {
+            Imgproc.cvtColor(roiMat, grayScratch, Imgproc.COLOR_BGR2GRAY);
+            decodeRoiMat = grayScratch;
+        }
+
+        // === STAGE 1: COARSE - Calculate scaling and resize ===
+        ATRContext atrContext;
+        Mat processingMat;
+
+        if (params.atrEnabled && roiRect.width > params.atrTargetDimension) {
+            // Calculate scale factor: S = min(1.0, T_dim / w)
+            double S = (double) params.atrTargetDimension / roiRect.width;
+            S = Math.max(S, params.atrMinScaleFactor); // Clamp to prevent extreme scaling
+
+            int scaledWidth = (int) Math.round(roiRect.width * S);
+            int scaledHeight = (int) Math.round(roiRect.height * S);
+
+            atrContext = new ATRContext(S);
+
+            // Downscale ROI to target dimension
+            Imgproc.resize(
+                    decodeRoiMat,
+                    resizeScratch,
+                    new Size(scaledWidth, scaledHeight),
+                    0,
+                    0,
+                    Imgproc.INTER_AREA); // INTER_AREA best for downscaling
+            processingMat = resizeScratch;
+        } else {
+            // No scaling needed (tag already small or ATR disabled)
+            atrContext = ATRContext.noScaling();
+            processingMat = decodeRoiMat;
+        }
+
+        if (CONTIGUOUS_ROI_COPY && !processingMat.isContinuous()) {
+            processingMat.copyTo(contiguousScratch);
+            processingMat = contiguousScratch;
+        }
+
+        // Run AprilTag detection on (possibly scaled) image
+        AprilTagDetection[] roiDetections = activeDetector.detect(processingMat);
+
+        for (AprilTagDetection det : roiDetections) {
+            if (det.getHamming() > params.maxHammingDistance) continue;
+            if (det.getDecisionMargin() < params.minDecisionMargin) continue;
+
+            // === STAGE 2: PROJECTION - Map coordinates back to full-frame ===
+            AprilTagDetection mappedDetection;
+            if (atrContext.wasScaled) {
+                mappedDetection = mapToFullFrameWithATR(det, roiRect, atrContext);
+            } else {
+                mappedDetection = mapToFullFrame(det, roiRect);
+            }
+
+            result.detections.add(mappedDetection);
+        }
+
+        return result;
     }
 
     /**
@@ -451,6 +671,14 @@ public class AprilTagROIDecodePipe
         return r.boundingRect();
     }
 
+    private long roiPixelArea(RotatedRect roi, int frameWidth, int frameHeight) {
+        Rect roiRect = clampToFrame(toIntRect(roi), frameWidth, frameHeight);
+        if (roiRect.width <= 0 || roiRect.height <= 0) {
+            return 0;
+        }
+        return (long) roiRect.width * roiRect.height;
+    }
+
     /** Clamps a rectangle to frame bounds. */
     private Rect clampToFrame(Rect r, int frameWidth, int frameHeight) {
         int x = Math.max(0, r.x);
@@ -465,6 +693,10 @@ public class AprilTagROIDecodePipe
      * cases where overlapping ROIs detect the same tag.
      */
     private List<AprilTagDetection> deduplicateByTagId(List<AprilTagDetection> detections) {
+        if (detections.size() <= 1) {
+            return detections;
+        }
+
         Map<Integer, AprilTagDetection> bestByTagId = new HashMap<>();
 
         for (AprilTagDetection det : detections) {
@@ -484,20 +716,101 @@ public class AprilTagROIDecodePipe
         if (newParams.tagFamily != currentFamily) {
             detector.clearFamilies();
             detector.addFamily(newParams.tagFamily.getNativeName());
+            for (ParallelWorker worker : parallelWorkers) {
+                worker.detector.clearFamilies();
+                worker.detector.addFamily(newParams.tagFamily.getNativeName());
+            }
             currentFamily = newParams.tagFamily;
         }
 
         detector.setConfig(newParams.detectorConfig);
         detector.setQuadThresholdParameters(newParams.quadParams);
+        configureParallelDetectors(newParams);
 
         super.setParams(newParams);
     }
 
     @Override
     public void release() {
+        resizedRoi.release();
+        grayRoi.release();
+        contiguousRoi.release();
         if (detector != null) {
             detector.close();
             detector = null;
+        }
+        for (ParallelWorker worker : parallelWorkers) {
+            worker.release();
+        }
+        parallelWorkers.clear();
+        if (parallelExecutor != null) {
+            parallelExecutor.shutdownNow();
+        }
+    }
+
+    private void configureParallelDetectors(ROIDecodeParams newParams) {
+        if (parallelWorkers.isEmpty()) {
+            configuredParallelDetectorThreads = 0;
+            return;
+        }
+
+        int workerCount = Math.max(1, parallelWorkers.size());
+        int detectorThreads =
+                PARALLEL_DETECTOR_THREADS > 0
+                        ? PARALLEL_DETECTOR_THREADS
+                        : Math.max(1, newParams.detectorConfig.numThreads / workerCount);
+        configuredParallelDetectorThreads = detectorThreads;
+
+        for (ParallelWorker worker : parallelWorkers) {
+            AprilTagDetector.Config workerConfig = copyConfig(newParams.detectorConfig);
+            workerConfig.numThreads = detectorThreads;
+            worker.detector.setConfig(workerConfig);
+            worker.detector.setQuadThresholdParameters(copyQuadParams(newParams.quadParams));
+        }
+    }
+
+    private static AprilTagDetector.Config copyConfig(AprilTagDetector.Config config) {
+        AprilTagDetector.Config copy = new AprilTagDetector.Config();
+        copy.numThreads = config.numThreads;
+        copy.quadDecimate = config.quadDecimate;
+        copy.quadSigma = config.quadSigma;
+        copy.refineEdges = config.refineEdges;
+        copy.decodeSharpening = config.decodeSharpening;
+        copy.debug = config.debug;
+        return copy;
+    }
+
+    private static AprilTagDetector.QuadThresholdParameters copyQuadParams(
+            AprilTagDetector.QuadThresholdParameters quadParams) {
+        AprilTagDetector.QuadThresholdParameters copy = new AprilTagDetector.QuadThresholdParameters();
+        copy.minClusterPixels = quadParams.minClusterPixels;
+        copy.maxNumMaxima = quadParams.maxNumMaxima;
+        copy.criticalAngle = quadParams.criticalAngle;
+        copy.maxLineFitMSE = quadParams.maxLineFitMSE;
+        copy.minWhiteBlackDiff = quadParams.minWhiteBlackDiff;
+        copy.deglitch = quadParams.deglitch;
+        return copy;
+    }
+
+    private static class RoiDecodeResult {
+        final List<AprilTagDetection> detections = new ArrayList<>();
+    }
+
+    private static class WorkerDecodeResult {
+        final List<AprilTagDetection> detections = new ArrayList<>();
+    }
+
+    private static class ParallelWorker {
+        final AprilTagDetector detector = new AprilTagDetector();
+        final Mat grayRoi = new Mat();
+        final Mat resizedRoi = new Mat();
+        final Mat contiguousRoi = new Mat();
+
+        void release() {
+            detector.close();
+            grayRoi.release();
+            resizedRoi.release();
+            contiguousRoi.release();
         }
     }
 }

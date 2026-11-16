@@ -66,8 +66,12 @@ public class AprilTagROIDetectionPipe
         }
 
         List<NeuralNetworkPipeResult> detections =
-                detector.detect(in.getMat(), params.nmsThreshold, params.confidenceThreshold);
+                detector.detect(in, params.nmsThreshold, params.confidenceThreshold);
+        if (detections.isEmpty()) {
+            return List.of();
+        }
 
+        rois = new ArrayList<>(detections.size());
         for (NeuralNetworkPipeResult detection : detections) {
             rois.add(detection.bbox());
         }

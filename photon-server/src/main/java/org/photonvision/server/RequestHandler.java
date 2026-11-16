@@ -29,6 +29,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.Locale;
 import java.util.Optional;
 import javax.imageio.ImageIO;
 import org.apache.commons.io.FileUtils;
@@ -61,6 +62,7 @@ import org.photonvision.vision.camera.PVCameraInfo;
 import org.photonvision.vision.objects.ObjectDetector;
 import org.photonvision.vision.objects.RknnModel;
 import org.photonvision.vision.objects.RubikModel;
+import org.photonvision.vision.objects.TensorRTModel;
 import org.photonvision.vision.processes.VisionSourceManager;
 import org.zeroturnaround.zip.ZipUtil;
 
@@ -615,35 +617,27 @@ public class RequestHandler {
                 return;
             }
 
-            NeuralNetworkModelManager.Family family;
-
-            switch (Platform.getCurrentPlatform()) {
-                case LINUX_QCS6490:
-                    family = NeuralNetworkModelManager.Family.RUBIK;
-                    break;
-                case LINUX_RK3588_64:
-                    family = NeuralNetworkModelManager.Family.RKNN;
-                    break;
-                default:
-                    ctx.status(400);
-                    ctx.result("The current platform does not support object detection models");
-                    logger.error("The current platform does not support object detection models");
-                    return;
+            NeuralNetworkModelManager.Family family = getObjectDetectionFamilyForCurrentPlatform();
+            if (family == null) {
+                ctx.status(400);
+                ctx.result("The current platform does not support object detection models");
+                logger.error("The current platform does not support object detection models");
+                return;
             }
 
             // If adding additional platforms, check platform matches
-            if (!modelFile.extension().contains(family.extension())) {
+            if (!modelFile.filename().toLowerCase(Locale.ROOT).endsWith(family.extension())) {
                 ctx.status(400);
                 ctx.result(
                         "The uploaded file was not of type '"
                                 + family.extension()
-                                + "'. The uploaded file should be a ."
+                                + "'. The uploaded file should be a "
                                 + family.extension()
                                 + " file.");
                 logger.error(
                         "The uploaded file was not of type '"
                                 + family.extension()
-                                + "'. The uploaded file should be a ."
+                                + "'. The uploaded file should be a "
                                 + family.extension()
                                 + " file.");
                 return;
@@ -680,6 +674,7 @@ public class RequestHandler {
                             switch (family) {
                                 case RUBIK -> new RubikModel(modelProperties).load();
                                 case RKNN -> new RknnModel(modelProperties).load();
+                                case TENSORRT -> new TensorRTModel(modelProperties).load();
                             };
                 } catch (RuntimeException e) {
                     ctx.status(400);
@@ -1243,6 +1238,18 @@ public class RequestHandler {
             ctx.result("An error occurred while getting calib data");
             logger.error("An error occurred while getting calib data", e);
         }
+    }
+
+    private static NeuralNetworkModelManager.Family getObjectDetectionFamilyForCurrentPlatform() {
+        if (Platform.isJetson()) {
+            return NeuralNetworkModelManager.Family.TENSORRT;
+        }
+
+        return switch (Platform.getCurrentPlatform()) {
+            case LINUX_QCS6490 -> NeuralNetworkModelManager.Family.RUBIK;
+            case LINUX_RK3588_64 -> NeuralNetworkModelManager.Family.RKNN;
+            default -> null;
+        };
     }
 
     /**

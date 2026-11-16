@@ -49,7 +49,9 @@ public class OutputStreamPipeline {
     private final long[] pipeProfileNanos = new long[12];
 
     protected void setPipeParams(
-            FrameStaticProperties frameStaticProperties, AdvancedPipelineSettings settings) {
+            FrameStaticProperties frameStaticProperties,
+            AdvancedPipelineSettings settings,
+            boolean outputShouldDraw) {
         var dualOffsetValues =
                 new DualOffsetValues(
                         settings.offsetDualPointA,
@@ -59,25 +61,19 @@ public class OutputStreamPipeline {
 
         draw2dTargetsPipe.setParams(
                 new Draw2dTargetsPipe.Draw2dTargetsParams(
-                        settings.outputShouldDraw,
-                        settings.outputMaximumTargets,
-                        settings.streamingFrameDivisor));
+                        outputShouldDraw, settings.outputMaximumTargets, settings.streamingFrameDivisor));
 
         draw2dAprilTagsPipe.setParams(
                 new Draw2dAprilTagsPipe.Draw2dAprilTagsParams(
-                        settings.outputShouldDraw,
-                        settings.outputMaximumTargets,
-                        settings.streamingFrameDivisor));
+                        outputShouldDraw, settings.outputMaximumTargets, settings.streamingFrameDivisor));
 
         draw2dArucoPipe.setParams(
                 new Draw2dArucoPipe.Draw2dArucoParams(
-                        settings.outputShouldDraw,
-                        settings.outputMaximumTargets,
-                        settings.streamingFrameDivisor));
+                        outputShouldDraw, settings.outputMaximumTargets, settings.streamingFrameDivisor));
 
         draw2dCrosshairPipe.setParams(
                 new Draw2dCrosshairPipe.Draw2dCrosshairParams(
-                        settings.outputShouldDraw,
+                        outputShouldDraw,
                         settings.offsetRobotOffsetMode,
                         settings.offsetSinglePoint,
                         dualOffsetValues,
@@ -87,21 +83,21 @@ public class OutputStreamPipeline {
 
         draw3dTargetsPipe.setParams(
                 new Draw3dTargetsPipe.Draw3dContoursParams(
-                        settings.outputShouldDraw,
+                        outputShouldDraw,
                         frameStaticProperties.cameraCalibration,
                         settings.targetModel,
                         settings.streamingFrameDivisor));
 
         draw3dAprilTagsPipe.setParams(
                 new Draw3dAprilTagsPipe.Draw3dAprilTagsParams(
-                        settings.outputShouldDraw,
+                        outputShouldDraw,
                         frameStaticProperties.cameraCalibration,
                         settings.targetModel,
                         settings.streamingFrameDivisor));
 
         draw3dArucoPipe.setParams(
                 new Draw3dArucoPipe.Draw3dArucoParams(
-                        settings.outputShouldDraw,
+                        outputShouldDraw,
                         frameStaticProperties.cameraCalibration,
                         settings.targetModel,
                         settings.streamingFrameDivisor));
@@ -118,9 +114,7 @@ public class OutputStreamPipeline {
         if (settings instanceof AprilTagPipelineSettings atSettings) {
             drawMLROIPipe.setParams(
                     new DrawMLROIPipe.DrawMLROIParams(
-                            settings.outputShouldDraw,
-                            atSettings.showDetectionBoxes,
-                            settings.streamingFrameDivisor));
+                            outputShouldDraw, atSettings.showDetectionBoxes, settings.streamingFrameDivisor));
         }
     }
 
@@ -129,23 +123,43 @@ public class OutputStreamPipeline {
             AdvancedPipelineSettings settings,
             List<TrackedTarget> targetsToDraw,
             List<RotatedRect> mlDetectionRois) {
-        setPipeParams(inputAndOutputFrame.frameStaticProperties, settings);
+        return process(
+                inputAndOutputFrame, settings, targetsToDraw, mlDetectionRois, StreamDemand.ALWAYS);
+    }
+
+    public CVPipelineResult process(
+            Frame inputAndOutputFrame,
+            AdvancedPipelineSettings settings,
+            List<TrackedTarget> targetsToDraw,
+            List<RotatedRect> mlDetectionRois,
+            StreamDemand streamDemand) {
+        boolean shouldProcessInput = streamDemand.effectiveInput(settings);
+        boolean shouldProcessOutput = streamDemand.effectiveOutput(settings);
+        boolean outputShouldDraw = streamDemand.effectiveOutputDraw(settings);
+
+        setPipeParams(inputAndOutputFrame.frameStaticProperties, settings, outputShouldDraw);
         var inMat = inputAndOutputFrame.colorImage.getMat();
         var outMat = inputAndOutputFrame.processedImage.getMat();
 
         long sumPipeNanosElapsed = 0L;
 
-        // Resize both in place before doing any conversion
+        // Resize only the streams that can actually be consumed.
         boolean inEmpty = inMat.empty();
-        if (!inEmpty)
+        if (shouldProcessInput && !inEmpty) {
             sumPipeNanosElapsed += pipeProfileNanos[0] = resizeImagePipe.run(inMat).nanosElapsed;
+        } else {
+            pipeProfileNanos[0] = 0;
+        }
 
         boolean outEmpty = outMat.empty();
-        if (!outEmpty)
+        if (shouldProcessOutput && !outEmpty) {
             sumPipeNanosElapsed += pipeProfileNanos[1] = resizeImagePipe.run(outMat).nanosElapsed;
+        } else {
+            pipeProfileNanos[1] = 0;
+        }
 
         // Only attempt drawing on a non-empty frame
-        if (!outEmpty) {
+        if (shouldProcessOutput && !outEmpty) {
             // Convert single-channel HSV output mat to 3-channel BGR in preparation for streaming
             if (outMat.channels() == 1) {
                 var outputMatPipeResult = outputMatPipe.run(outMat);
@@ -154,9 +168,12 @@ public class OutputStreamPipeline {
                 pipeProfileNanos[2] = 0;
             }
 
-            // Draw 2D Crosshair on output
-            var draw2dCrosshairResultOnInput = draw2dCrosshairPipe.run(Pair.of(inMat, targetsToDraw));
-            sumPipeNanosElapsed += pipeProfileNanos[3] = draw2dCrosshairResultOnInput.nanosElapsed;
+            if (shouldProcessInput && !inEmpty) {
+                var draw2dCrosshairResultOnInput = draw2dCrosshairPipe.run(Pair.of(inMat, targetsToDraw));
+                sumPipeNanosElapsed += pipeProfileNanos[3] = draw2dCrosshairResultOnInput.nanosElapsed;
+            } else {
+                pipeProfileNanos[3] = 0;
+            }
 
             if (!(settings instanceof AprilTagPipelineSettings)
                     && !(settings instanceof ArucoPipelineSettings)

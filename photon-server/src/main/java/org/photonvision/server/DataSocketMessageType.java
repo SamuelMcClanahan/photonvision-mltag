@@ -30,6 +30,7 @@ public enum DataSocketMessageType {
     SMT_DELETECURRENTPIPELINE("deleteCurrentPipeline"),
     SMT_CURRENTCAMERA("currentCamera"),
     SMT_PIPELINESETTINGCHANGE("changePipelineSetting"),
+    SMT_STREAMDEMAND("streamDemand"),
     SMT_CURRENTPIPELINE("currentPipeline"),
     SMT_STARTPNPCALIBRATION("startPnpCalibration"),
     SMT_SAVEINPUTSNAPSHOT("saveInputSnapshot"),

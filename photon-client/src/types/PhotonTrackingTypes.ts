@@ -70,6 +70,12 @@ export interface PipelineResult {
   sequenceID: number;
   fps: number;
   latency: number;
+  processingMs?: number;
+  captureTimestampNanos?: number;
+  captureSource?: string;
+  captureAgeAtPublishMs?: number;
+  captureEstimatedAgeMs?: number | null;
+  captureNativeSequence?: number;
   // Focus pipeline
   focus?: number;
   targets: PhotonTarget[];

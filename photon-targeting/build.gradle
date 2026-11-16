@@ -172,7 +172,10 @@ cppHeadersZip {
 wpilibTools.deps.wpilibVersion = wpilibVersion
 
 def nativeConfigName = 'wpilibNatives'
-def nativeConfig = configurations.create(nativeConfigName)
+def nativeConfig = configurations.create(nativeConfigName) {
+    canBeConsumed = false
+    canBeResolved = true
+}
 
 def nativeTasks = wpilibTools.createExtractionTasks {
     configurationName = nativeConfigName

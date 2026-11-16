@@ -1,6 +1,7 @@
 apply plugin: 'org.photonvision.tools.WpilibTools'
 
 import java.nio.file.Path
+import java.util.Locale
 
 ext.licenseFile = file("$rootDir/LICENSE")
 ext.externalLicensesFolder = file("$rootDir/ExternalLicenses")
@@ -16,10 +17,110 @@ def nativeTasks = wpilibTools.createExtractionTasks {
     configurationName = nativeConfigName
 }
 
+if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac")) {
+    nativeTasks.fixup.configure { fixupTask ->
+        // The upstream task runs `strip -x -S` on every copied native library.
+        // Apple's strip can fail on fat OpenCV dylibs even though otool and codesign can
+        // still process them correctly, so keep the install-name fixups but make strip
+        // best-effort on macOS.
+        fixupTask.actions.clear()
+        fixupTask.doLast {
+            def inputDir = fixupTask.getInputDirectory().get().asFile
+            def outputDir = fixupTask.getOutputDirectory().get().asFile
+
+            project.sync {
+                from inputDir
+                into outputDir
+            }
+
+            def runCommand = { List<String> command, boolean ignoreExitValue ->
+                def commandStrings = command.collect { it.toString() }
+                def outputBytes = new ByteArrayOutputStream()
+                def process = new ProcessBuilder(commandStrings)
+                        .redirectErrorStream(true)
+                        .start()
+                process.inputStream.transferTo(outputBytes)
+                def exitValue = process.waitFor()
+
+                if (exitValue != 0 && !ignoreExitValue) {
+                    throw new GradleException("Command failed (${exitValue}): ${commandStrings.join(' ')}\n${outputBytes}")
+                }
+
+                [exitValue: exitValue, output: outputBytes.toString()]
+            }
+
+            fileTree(outputDir).files.findAll { it.isFile() }.each { nativeFile ->
+                def stripResult = runCommand(["strip", "-x", "-S", nativeFile.absolutePath], true)
+
+                if (stripResult.exitValue != 0) {
+                    fixupTask.logger.info("Continuing after strip failed for ${nativeFile.name}")
+                }
+
+                def otoolResult = runCommand(["otool", "-L", nativeFile.absolutePath], true)
+
+                if (otoolResult.exitValue != 0) {
+                    fixupTask.logger.info("Skipping install-name and codesign fixups for ${nativeFile.name}")
+                    return
+                }
+
+                def dependencies = new LinkedHashSet<String>()
+                otoolResult.output.eachLine { line ->
+                    def trimmed = line.trim()
+                    if (!trimmed
+                            || trimmed.contains(nativeFile.name)
+                            || trimmed.startsWith("/")
+                            || trimmed.endsWith(":")) {
+                        return
+                    }
+
+                    dependencies.add(trimmed.split(/\s+/)[0])
+                }
+
+                dependencies.each { dependency ->
+                    def loaderPathDependency = dependency.startsWith("@rpath/")
+                            ? dependency.substring("@rpath/".length())
+                            : dependency
+
+                    runCommand(["install_name_tool", "-change",
+                                dependency,
+                                "@loader_path/${loaderPathDependency}",
+                                nativeFile.absolutePath], false)
+                }
+
+                runCommand(["codesign", "--force", "--sign", "-", nativeFile.absolutePath], false)
+            }
+        }
+    }
+}
+
 nativeTasks.addToSourceSetResources(sourceSets.main)
 
+def photonTargetingNativePlatformPaths = [
+    linuxarm64: [resourcePath: "linux/arm64", sharedExt: "so"],
+    osxuniversal: [resourcePath: "osx/universal", sharedExt: "dylib"],
+]
+
+def photonTargetingNativeInfo = photonTargetingNativePlatformPaths[jniPlatform]
+if (photonTargetingNativeInfo != null) {
+    def photonTargetingTaskSuffix = jniPlatform.capitalize()
+    def photonTargetingProject = project(":photon-targeting")
+    def copyPhotonTargetingNatives = tasks.register("copyPhotonTargetingNativesMain", Copy) {
+        dependsOn nativeTasks.fixup
+        dependsOn ":photon-targeting:photontargeting${photonTargetingTaskSuffix}ReleaseSharedLibrary"
+        dependsOn ":photon-targeting:photontargetingJNI${photonTargetingTaskSuffix}ReleaseSharedLibrary"
+
+        def sharedExt = photonTargetingNativeInfo.sharedExt
+        from(photonTargetingProject.layout.buildDirectory.file("libs/photontargeting/shared/${jniPlatform}/release/libphotontargeting.${sharedExt}"))
+        from(photonTargetingProject.layout.buildDirectory.file("libs/photontargetingJNI/shared/${jniPlatform}/release/libphotontargetingJNI.${sharedExt}"))
+        into(layout.buildDirectory.dir("NativeMain/RuntimeLibs/${photonTargetingNativeInfo.resourcePath}/shared"))
+    }
+
+    nativeTasks.hash.configure {
+        dependsOn copyPhotonTargetingNatives
+    }
+}
+
 dependencies {
-    wpilibNatives project(path: ':photon-targeting', configuration: 'wpilibNatives')
     wpilibNatives wpilibTools.deps.wpilib("wpimath")
     wpilibNatives wpilibTools.deps.wpilib("wpinet")
     wpilibNatives wpilibTools.deps.wpilib("wpiutil")

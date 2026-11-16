@@ -17,6 +17,7 @@
 
 package org.photonvision.vision.frame.consumer;
 
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.vision.frame.StaticFrames;
 import org.photonvision.vision.opencv.CVMat;
@@ -25,8 +26,9 @@ import org.wpilib.vision.camera.*;
 import org.wpilib.vision.stream.CameraServer;
 
 public class MJPGFrameConsumer implements AutoCloseable {
-    private static final double MAX_FRAMERATE = -1;
-    private static final long MAX_FRAME_PERIOD_NS = Math.round(1e9 / MAX_FRAMERATE);
+    private static final double MAX_FRAMERATE = parseMaxFramerate();
+    private static final long MAX_FRAME_PERIOD_NS =
+            MAX_FRAMERATE > 0 ? Math.round(1e9 / MAX_FRAMERATE) : 0;
 
     private long lastFrameTimeNs;
     private CvSource cvSource;
@@ -48,14 +50,20 @@ public class MJPGFrameConsumer implements AutoCloseable {
     public void accept(CVMat image) {
         long now = MathUtils.wpiNanoTime();
 
-        if (image == null || image.getMat() == null || image.getMat().empty()) {
+        if (image == null) return;
+
+        if (image.getMat() == null || image.getMat().empty()) {
             image.copyFrom(StaticFrames.LOST_MAT);
         }
 
-        if (now - lastFrameTimeNs > MAX_FRAME_PERIOD_NS) {
+        if (MAX_FRAME_PERIOD_NS <= 0 || now - lastFrameTimeNs > MAX_FRAME_PERIOD_NS) {
             lastFrameTimeNs = now;
             cvSource.putFrame(image.getMat());
         }
+    }
+
+    private static double parseMaxFramerate() {
+        return EnvUtils.decimal("PV_MJPG_MAX_FPS", -1);
     }
 
     @Override

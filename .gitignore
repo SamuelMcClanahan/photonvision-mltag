@@ -145,6 +145,7 @@ networktables.json
 # Web stuff
 photon-server/src/main/resources/web/*
 node_modules
+.pnpm-store/
 dist
 dist-ssr
 components.d.ts
@@ -163,3 +164,14 @@ flake.nix
 flake.lock
 
 /workspace
+
+# Local ML/Jetson experiments
+runs/
+backups/
+yolo*.pt
+tools/**/__pycache__/
+
+# Nested clones (pushed separately)
+.worktrees/
+# Roboflow dataset (re-download: https://universe.roboflow.com/johnspace-ivyq6/2026-frc-apriltags v7)
+qcom_model_export/dataset/

@@ -1,0 +1,5 @@
+{"threshold":0.5,"samples":49,"hits":3,"hitRate":0.061224489795918366,"averageFps":123.22448979591837,"averageProcessingMs":5.540267163265307,"averageLatencyMs":5.64804081632653}
+{"threshold":0.4,"samples":49,"hits":6,"hitRate":0.12244897959183673,"averageFps":125.89795918367346,"averageProcessingMs":5.790093163265306,"averageLatencyMs":5.906346938775509}
+{"threshold":0.3,"samples":48,"hits":27,"hitRate":0.5625,"averageFps":122.22916666666667,"averageProcessingMs":8.820337895833331,"averageLatencyMs":8.9745625}
+{"threshold":0.2,"samples":47,"hits":46,"hitRate":0.9787234042553191,"averageFps":84.53191489361703,"averageProcessingMs":12.173420170212767,"averageLatencyMs":12.37223404255319}
+{"threshold":0.125,"samples":47,"hits":47,"hitRate":1,"averageFps":80.46808510638297,"averageProcessingMs":12.501887957446812,"averageLatencyMs":12.697489361702127}

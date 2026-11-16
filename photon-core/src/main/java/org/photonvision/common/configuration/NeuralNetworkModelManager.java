@@ -41,6 +41,7 @@ import org.photonvision.common.logging.Logger;
 import org.photonvision.vision.objects.Model;
 import org.photonvision.vision.objects.RknnModel;
 import org.photonvision.vision.objects.RubikModel;
+import org.photonvision.vision.objects.TensorRTModel;
 
 /**
  * Manages the loading of neural network models.
@@ -209,6 +210,16 @@ public class NeuralNetworkModelManager {
                         Family.RUBIK,
                         Version.YOLOV11));
 
+        nnProps.addModelProperties(
+                new ModelProperties(
+                        Path.of(modelsDirectory.getAbsolutePath(), "apriltag-yolo11n-640-int8.tflite"),
+                        "AprilTag YOLO11n INT8",
+                        new LinkedList<String>(List.of("AprilTag")),
+                        640,
+                        640,
+                        Family.RUBIK,
+                        Version.YOLOV11));
+
         return nnProps;
     }
 
@@ -218,6 +229,11 @@ public class NeuralNetworkModelManager {
      * @return The NeuralNetworkModelManager instance
      */
     private NeuralNetworkModelManager() {
+        if (Platform.isJetson()) {
+            supportedBackends.add(Family.TENSORRT);
+            return;
+        }
+
         switch (Platform.getCurrentPlatform()) {
             case LINUX_QCS6490 -> supportedBackends.add(Family.RUBIK);
             case LINUX_RK3588_64 -> supportedBackends.add(Family.RKNN);
@@ -259,7 +275,8 @@ public class NeuralNetworkModelManager {
 
     public enum Family {
         RKNN(".rknn"),
-        RUBIK(".tflite");
+        RUBIK(".tflite"),
+        TENSORRT(".engine");
 
         private final String fileExtension;
 
@@ -328,7 +345,12 @@ public class NeuralNetworkModelManager {
             return Optional.empty();
         }
 
-        return models.get(supportedBackends.get(0)).stream().findFirst();
+        var backendModels = models.get(supportedBackends.get(0));
+        if (backendModels == null) {
+            return Optional.empty();
+        }
+
+        return backendModels.stream().findFirst();
     }
 
     /**
@@ -429,6 +451,9 @@ public class NeuralNetworkModelManager {
                 }
                 case RUBIK -> {
                     models.get(properties.family()).add(new RubikModel(properties));
+                }
+                case TENSORRT -> {
+                    models.get(properties.family()).add(new TensorRTModel(properties));
                 }
             }
             logger.info(

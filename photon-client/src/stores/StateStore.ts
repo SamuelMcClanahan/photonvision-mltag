@@ -29,6 +29,7 @@ interface StateStore {
   sidebarFolded: boolean;
   logMessages: LogMessage[];
   currentCameraUniqueName: string;
+  activeStreamPreviewKey: string | null;
   networkUsageHistory: NetworkUsageEntry[];
 
   // Key is a string, although often used as an index, because we need to reference using the camera unique name at times.
@@ -71,6 +72,7 @@ export const useStateStore = defineStore("state", {
         localStorage.getItem("sidebarFolded") === null ? false : localStorage.getItem("sidebarFolded") === "true",
       logMessages: [],
       currentCameraUniqueName: Object.keys(cameraStore.cameras)[0],
+      activeStreamPreviewKey: null,
       networkUsageHistory: [],
 
       backendResults: {
@@ -123,6 +125,9 @@ export const useStateStore = defineStore("state", {
     setSidebarFolded(value: boolean) {
       this.sidebarFolded = value;
       localStorage.setItem("sidebarFolded", Boolean(value).toString());
+    },
+    setActiveStreamPreviewKey(value: string | null) {
+      this.activeStreamPreviewKey = value;
     },
     addLogFromWebsocket(data: WebsocketLogMessage) {
       this.logMessages.push({

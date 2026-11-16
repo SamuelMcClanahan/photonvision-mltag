@@ -71,6 +71,8 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     private final AprilTagMLHybridPipe mlHybridPipe = new AprilTagMLHybridPipe();
     private boolean mlAvailable = false;
     private boolean mlWasAvailable = false;
+    private boolean pipeParamsConfigured = false;
+    private int lastPipeParamsHash = 0;
 
     private static final FrameThresholdType PROCESSING_TYPE = FrameThresholdType.GREYSCALE;
 
@@ -85,9 +87,22 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     }
 
     @Override
+    public FrameThresholdType getThresholdType() {
+        if (settings != null && settings.useMLDetection && !settings.outputShouldShow) {
+            return FrameThresholdType.NONE;
+        }
+        return PROCESSING_TYPE;
+    }
+
+    @Override
     protected void setPipeParamsImpl() {
         // Sanitize thread count - not supported to have fewer than 1 threads
         settings.threads = Math.max(1, settings.threads);
+
+        int pipeParamsHash = pipeParamsHash();
+        if (pipeParamsConfigured && pipeParamsHash == lastPipeParamsHash) {
+            return;
+        }
 
         // for now, hard code tag width based on enum value
         // From 2024 best guess is 6.5
@@ -192,13 +207,28 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             mlAvailable = false;
         }
         mlWasAvailable = mlAvailable;
+        lastPipeParamsHash = pipeParamsHash;
+        pipeParamsConfigured = true;
+    }
+
+    private int pipeParamsHash() {
+        final int prime = 31;
+        int result = settings.hashCode();
+        result = prime * result + frameStaticProperties.imageWidth;
+        result = prime * result + frameStaticProperties.imageHeight;
+        long fovBits = Double.doubleToLongBits(frameStaticProperties.fov);
+        result = prime * result + (int) (fovBits ^ (fovBits >>> 32));
+        result = prime * result + System.identityHashCode(frameStaticProperties.cameraCalibration);
+        return result;
     }
 
     @Override
     protected CVPipelineResult process(Frame frame, AprilTagPipelineSettings settings) {
         long sumPipeNanosElapsed = 0L;
 
-        if (frame.type != FrameThresholdType.GREYSCALE) {
+        boolean useML = settings.useMLDetection && mlAvailable;
+
+        if (!useML && frame.type != FrameThresholdType.GREYSCALE) {
             // We asked for a GREYSCALE frame, but didn't get one -- best we can do is give up
             return new CVPipelineResult(frame.sequenceID, 0, 0, List.of(), frame);
         }
@@ -208,7 +238,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         long detectionNanos;
         List<RotatedRect> mlDetectionRois = List.of();
 
-        if (settings.useMLDetection && mlAvailable) {
+        if (useML) {
             // Use ML-assisted hybrid detection
             var hybridResult = mlHybridPipe.run(frame);
             detections = hybridResult.output.detections();
@@ -338,11 +368,13 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
 
     /**
      * Checks if ML detection is available on the current platform. Currently supported: RK3588
-     * (Orange Pi 5, Rock 5C, CoolPi 4B) and QCS6490 (Rubik Pi 3).
+     * (Orange Pi 5, Rock 5C, CoolPi 4B), QCS6490 (Rubik Pi 3), and NVIDIA Jetson via TensorRT.
      */
     private boolean checkMLAvailability() {
         Platform platform = Platform.getCurrentPlatform();
-        return platform == Platform.LINUX_QCS6490 || platform == Platform.LINUX_RK3588_64;
+        return platform == Platform.LINUX_QCS6490
+                || platform == Platform.LINUX_RK3588_64
+                || Platform.isJetson();
     }
 
     @Override

@@ -31,6 +31,6 @@ public class InnoOV9281CameraSettables extends GenericUSBCameraSettables {
 
         // Property limits are incorrect
         this.minExposure = 1;
-        this.maxExposure = 500;
+        this.maxExposure = 5000;
     }
 }

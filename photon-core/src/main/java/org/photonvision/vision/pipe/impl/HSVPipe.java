@@ -28,6 +28,10 @@ public class HSVPipe extends CVPipe<Mat, Mat, HSVPipe.HSVParams> {
     @Override
     protected Mat process(Mat in) {
         var outputMat = new Mat();
+        return processInto(in, outputMat);
+    }
+
+    public Mat processInto(Mat in, Mat outputMat) {
         // We can save a copy here by sending the output of cvtcolor to outputMat directly
         // rather than copying. Free performance!
         Imgproc.cvtColor(in, outputMat, Imgproc.COLOR_BGR2HSV, 3);

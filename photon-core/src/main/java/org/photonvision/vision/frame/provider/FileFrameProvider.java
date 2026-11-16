@@ -24,6 +24,7 @@ import org.opencv.core.Mat;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.vision.calibration.CameraCalibrationCoefficients;
+import org.photonvision.vision.frame.FrameCaptureMetadata;
 import org.photonvision.vision.frame.FrameProvider;
 import org.photonvision.vision.frame.FrameStaticProperties;
 import org.photonvision.vision.opencv.CVMat;
@@ -114,7 +115,10 @@ public class FileFrameProvider extends CpuImageProcessor implements Releasable {
         }
 
         lastGetMillis = System.currentTimeMillis();
-        return new CapturedFrame(out, properties, MathUtils.wpiNanoTime());
+        return new CapturedFrame(
+                out,
+                properties,
+                FrameCaptureMetadata.simple(FrameCaptureMetadata.SOURCE_FILE, MathUtils.wpiNanoTime()));
     }
 
     @Override
@@ -125,6 +129,7 @@ public class FileFrameProvider extends CpuImageProcessor implements Releasable {
     @Override
     public void release() {
         originalFrame.release();
+        releaseProcessorResources();
     }
 
     @Override

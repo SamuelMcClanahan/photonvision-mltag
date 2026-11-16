@@ -28,6 +28,7 @@ public class Frame implements Releasable {
 
     public final long sequenceID;
     public final long timestampNanos;
+    public final FrameCaptureMetadata captureMetadata;
 
     // Frame should at _least_ contain the thresholded frame, and sometimes the color image
     public final CVMat colorImage;
@@ -43,11 +44,31 @@ public class Frame implements Releasable {
             FrameThresholdType type,
             long timestampNanos,
             FrameStaticProperties frameStaticProperties) {
+        this(
+                sequenceID,
+                color,
+                processed,
+                type,
+                FrameCaptureMetadata.unknown(timestampNanos),
+                frameStaticProperties);
+    }
+
+    public Frame(
+            long sequenceID,
+            CVMat color,
+            CVMat processed,
+            FrameThresholdType type,
+            FrameCaptureMetadata captureMetadata,
+            FrameStaticProperties frameStaticProperties) {
         this.sequenceID = sequenceID;
         this.colorImage = color;
         this.processedImage = processed;
         this.type = type;
-        this.timestampNanos = timestampNanos;
+        this.captureMetadata =
+                captureMetadata != null
+                        ? captureMetadata
+                        : FrameCaptureMetadata.unknown(MathUtils.wpiNanoTime());
+        this.timestampNanos = this.captureMetadata.captureTimestampNanos();
         this.frameStaticProperties = frameStaticProperties;
 
         logger.trace(

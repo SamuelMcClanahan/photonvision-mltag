@@ -40,6 +40,9 @@ public class RotateImagePipe extends MutatingPipe<Mat, RotateImagePipe.RotateIma
      */
     @Override
     protected Void process(Mat in) {
+        if (params.rotation() == ImageRotationMode.DEG_0) {
+            return null;
+        }
         Core.rotate(in, in, params.rotation().value);
         return null;
     }

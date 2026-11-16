@@ -25,6 +25,29 @@ const importHeight = ref<number | null>(null);
 const importWidth = ref<number | null>(null);
 const importVersion = ref<string | null>(null);
 
+const activeBackend = computed(() => {
+  const supportedBackends = useSettingsStore().general.supportedBackends || [];
+  if (supportedBackends.includes("TENSORRT")) return "TENSORRT";
+  if (supportedBackends.includes("RKNN")) return "RKNN";
+  if (supportedBackends.includes("RUBIK")) return "RUBIK";
+  return "";
+});
+const modelFileAccept = computed(() => {
+  switch (activeBackend.value) {
+    case "TENSORRT":
+      return ".engine";
+    case "RKNN":
+      return ".rknn";
+    case "RUBIK":
+      return ".tflite";
+    default:
+      return "";
+  }
+});
+const importVersionItems = computed(() =>
+  activeBackend.value === "RKNN" ? ["YOLOv5", "YOLOv8", "YOLO11"] : ["YOLOv8", "YOLO11"]
+);
+
 // TODO gray out the button when model is uploading
 const handleImport = async () => {
   if (importModelFile.value === null) return;
@@ -188,12 +211,17 @@ const handleBulkImport = async () => {
             <v-card color="surface" dark>
               <v-card-title class="pb-0">Import New Object Detection Model</v-card-title>
               <v-card-text>
-                <span v-if="useSettingsStore().general.supportedBackends?.includes('RKNN')"
+                <span v-if="activeBackend === 'TENSORRT'"
+                  >Upload a new object detection model to this device that can be used in a pipeline. Note that ONLY
+                  640x640 YOLOv8 and YOLO11 models converted to TensorRT `.engine` format for NVIDIA Jetson backends are
+                  currently supported!</span
+                >
+                <span v-else-if="activeBackend === 'RKNN'"
                   >Upload a new object detection model to this device that can be used in a pipeline. Note that ONLY
                   640x640 YOLOv5, YOLOv8, and YOLOv11 models trained and converted to `.rknn` format for RK3588 SOCs are
                   currently supporter!</span
                 >
-                <span v-else-if="useSettingsStore().general.supportedBackends?.includes('RUBIK')"
+                <span v-else-if="activeBackend === 'RUBIK'"
                   >Upload a new object detection model to this device that can be used in a pipeline. Note that ONLY
                   640x640 YOLOv8 and YOLOv11 models trained and converted to `.tflite` format for QCS6490 compatible
                   backends are currently supported!
@@ -207,13 +235,7 @@ const handleBulkImport = async () => {
                     v-model="importModelFile"
                     variant="underlined"
                     label="Model File"
-                    :accept="
-                      useSettingsStore().general.supportedBackends?.includes('RKNN')
-                        ? '.rknn'
-                        : useSettingsStore().general.supportedBackends?.includes('RUBIK')
-                          ? '.tflite'
-                          : ''
-                    "
+                    :accept="modelFileAccept"
                   />
                   <v-text-field
                     v-model="importLabels"
@@ -229,11 +251,7 @@ const handleBulkImport = async () => {
                     variant="underlined"
                     label="Model Version"
                     data-testid="import-version-select"
-                    :items="
-                      useSettingsStore().general.supportedBackends?.includes('RKNN')
-                        ? ['YOLOv5', 'YOLOv8', 'YOLO11']
-                        : ['YOLOv8', 'YOLO11']
-                    "
+                    :items="importVersionItems"
                   />
                   <v-btn
                     color="buttonActive"

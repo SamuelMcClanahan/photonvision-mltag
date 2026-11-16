@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, useTemplateRef } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from "vue";
 import { useStateStore } from "@/stores/StateStore";
 import { useCameraSettingsStore } from "@/stores/settings/CameraSettingsStore";
 import type { StyleValue } from "vue";
@@ -15,8 +15,20 @@ const props = defineProps<{
 
 const backendHostname = inject<string>("backendHostname");
 const emptyStreamSrc = "//:0";
+const demandId = `stream-${props.id}-${Math.random().toString(36).slice(2)}`;
+const previewEnabled = ref(false);
+const streamDemandActive = ref(false);
+const effectiveStreamType = computed<"Raw" | "Processed">(() => {
+  const pipelineSettings = props.cameraSettings.pipelineSettings;
+
+  if (props.streamType === "Raw" && !pipelineSettings.inputShouldShow && pipelineSettings.outputShouldShow) {
+    return "Processed";
+  }
+
+  return props.streamType;
+});
 const streamSrc = computed<string>(() => {
-  const port = props.cameraSettings.stream[props.streamType === "Raw" ? "inputPort" : "outputPort"];
+  const port = props.cameraSettings.stream[effectiveStreamType.value === "Raw" ? "inputPort" : "outputPort"];
 
   if (!useStateStore().backendConnected || port === 0) {
     return emptyStreamSrc;
@@ -24,7 +36,9 @@ const streamSrc = computed<string>(() => {
 
   return `http://${backendHostname}:${port}/stream.mjpg`;
 });
-const streamDesc = computed<string>(() => `${props.streamType} Stream View`);
+const displayedStreamSrc = computed<string>(() => (streamDemandActive.value ? streamSrc.value : emptyStreamSrc));
+const streamDesc = computed<string>(() => `${effectiveStreamType.value} Stream View`);
+const previewKey = computed<string>(() => `${props.cameraSettings.uniqueName}:${effectiveStreamType.value}:${props.id}`);
 const streamStyle = computed<StyleValue>(() => {
   if (useStateStore().colorPickingMode) {
     return { cursor: "crosshair" };
@@ -51,7 +65,7 @@ const containerStyle = computed<StyleValue>(() => {
 });
 
 const overlayStyle = computed<StyleValue>(() => {
-  if (useStateStore().colorPickingMode || streamSrc.value === emptyStreamSrc) {
+  if (useStateStore().colorPickingMode || displayedStreamSrc.value === emptyStreamSrc) {
     return { display: "none" };
   } else {
     return {};
@@ -59,16 +73,24 @@ const overlayStyle = computed<StyleValue>(() => {
 });
 
 const handleCaptureClick = () => {
-  if (props.streamType === "Raw") {
+  if (effectiveStreamType.value === "Raw") {
     useCameraSettingsStore().saveInputSnapshot();
   } else {
     useCameraSettingsStore().saveOutputSnapshot();
   }
 };
 const handlePopoutClick = () => {
-  window.open(streamSrc.value);
+  if (!streamDemandActive.value) return;
+  window.open(displayedStreamSrc.value);
+};
+const handlePreviewToggle = () => {
+  const nextPreviewEnabled = !previewEnabled.value;
+  previewEnabled.value = nextPreviewEnabled;
+  useStateStore().setActiveStreamPreviewKey(nextPreviewEnabled ? previewKey.value : null);
+  publishStreamDemand();
 };
 const handleFullscreenRequest = async () => {
+  if (!streamDemandActive.value) return;
   const stream = document.getElementById(props.id);
   if (!stream) return;
   await stream.requestFullscreen();
@@ -77,15 +99,66 @@ const handleFullscreenRequest = async () => {
 const mjpgStream = useTemplateRef("mjpgStream");
 
 const handleStreamError = () => {
-  if (streamSrc.value && streamSrc.value !== emptyStreamSrc) {
-    console.error("Error loading stream:", streamSrc.value, " Trying again.");
+  if (displayedStreamSrc.value && displayedStreamSrc.value !== emptyStreamSrc) {
+    console.error("Error loading stream:", displayedStreamSrc.value, " Trying again.");
     setTimeout(() => {
-      mjpgStream.value!.src = streamSrc.value;
+      if (mjpgStream.value && streamDemandActive.value) {
+        mjpgStream.value.src = displayedStreamSrc.value;
+      }
     }, 100);
   }
 };
 
+const shouldDemandStream = () =>
+  previewEnabled.value &&
+  useStateStore().backendConnected &&
+  streamSrc.value !== emptyStreamSrc &&
+  document.visibilityState === "visible" &&
+  document.hasFocus();
+
+const publishStreamDemand = () => {
+  const active = shouldDemandStream();
+  streamDemandActive.value = active;
+  useCameraSettingsStore().setStreamDemand(
+    props.cameraSettings.uniqueName,
+    demandId,
+    active && effectiveStreamType.value === "Raw",
+    active && effectiveStreamType.value === "Processed"
+  );
+};
+
+let demandHeartbeat: number | undefined;
+
+onMounted(() => {
+  document.addEventListener("visibilitychange", publishStreamDemand);
+  window.addEventListener("focus", publishStreamDemand);
+  window.addEventListener("blur", publishStreamDemand);
+  demandHeartbeat = window.setInterval(publishStreamDemand, 1000);
+  publishStreamDemand();
+});
+
+watch([streamSrc, effectiveStreamType], publishStreamDemand);
+watch(
+  () => useStateStore().activeStreamPreviewKey,
+  (activePreviewKey) => {
+    if (activePreviewKey === previewKey.value || !previewEnabled.value) return;
+    previewEnabled.value = false;
+    publishStreamDemand();
+  }
+);
+
 onBeforeUnmount(() => {
+  if (demandHeartbeat !== undefined) {
+    window.clearInterval(demandHeartbeat);
+  }
+  document.removeEventListener("visibilitychange", publishStreamDemand);
+  window.removeEventListener("focus", publishStreamDemand);
+  window.removeEventListener("blur", publishStreamDemand);
+  if (useStateStore().activeStreamPreviewKey === previewKey.value) {
+    useStateStore().setActiveStreamPreviewKey(null);
+  }
+  useCameraSettingsStore().setStreamDemand(props.cameraSettings.uniqueName, demandId, false, false);
+  streamDemandActive.value = false;
   if (!mjpgStream.value) return;
   mjpgStream.value.src = emptyStreamSrc;
 });
@@ -93,18 +166,38 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="stream-container" :style="containerStyle">
-    <pv-loading class="stream-loading" />
+    <pv-loading v-if="streamDemandActive" class="stream-loading" />
     <img
+      :key="displayedStreamSrc"
       :id="id"
       ref="mjpgStream"
       class="stream-video"
       crossorigin="anonymous"
-      :src="streamSrc"
+      :src="displayedStreamSrc"
       :alt="streamDesc"
       :style="streamStyle"
       @error="handleStreamError"
     />
+    <div v-if="!streamDemandActive" class="stream-idle">
+      <v-btn
+        icon
+        color="primary"
+        variant="tonal"
+        :aria-label="`Enable ${streamDesc}`"
+        :title="`Enable ${streamDesc}`"
+        @click="handlePreviewToggle"
+      >
+        <v-icon>mdi-eye</v-icon>
+      </v-btn>
+    </div>
     <div class="stream-overlay" :style="overlayStyle">
+      <pv-icon
+        color="primary"
+        icon-name="mdi-eye-off"
+        tooltip="Disable this stream"
+        class="ma-1 mr-2"
+        @click="handlePreviewToggle"
+      />
       <pv-icon
         color="primary"
         icon-name="mdi-camera-image"
@@ -154,6 +247,14 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.stream-idle {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .stream-overlay {

@@ -1,0 +1,70 @@
+Linux photonvision 6.8.0-1055-qcom #55-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep 17 02:03:34 UTC 2025 aarch64 aarch64 aarch64 GNU/Linux
+Architecture:                         aarch64
+CPU op-mode(s):                       32-bit, 64-bit
+Byte Order:                           Little Endian
+CPU(s):                               8
+On-line CPU(s) list:                  0-7
+Vendor ID:                            ARM
+Model name:                           Cortex-A55
+Model:                                0
+Thread(s) per core:                   1
+Core(s) per socket:                   4
+Socket(s):                            1
+Stepping:                             r2p0
+CPU(s) scaling MHz:                   100%
+CPU max MHz:                          1958.4000
+CPU min MHz:                          300.0000
+BogoMIPS:                             38.40
+Flags:                                fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp
+Model name:                           Cortex-A78
+Model:                                1
+Thread(s) per core:                   1
+Core(s) per socket:                   4
+Socket(s):                            1
+Stepping:                             r1p1
+CPU(s) scaling MHz:                   100%
+CPU max MHz:                          2707.2000
+CPU min MHz:                          691.2000
+BogoMIPS:                             38.40
+Flags:                                fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp
+NUMA node(s):                         1
+NUMA node0 CPU(s):                    0-7
+Vulnerability Gather data sampling:   Not affected
+Vulnerability Itlb multihit:          Not affected
+Vulnerability L1tf:                   Not affected
+Vulnerability Mds:                    Not affected
+Vulnerability Meltdown:               Not affected
+Vulnerability Mmio stale data:        Not affected
+Vulnerability Reg file data sampling: Not affected
+Vulnerability Retbleed:               Not affected
+Vulnerability Spec rstack overflow:   Not affected
+Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:             Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:             Mitigation; CSV2, BHB
+Vulnerability Srbds:                  Not affected
+Vulnerability Tsx async abort:        Not affected
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/4p, 480M
+    |__ Port 002: Dev 003, If 0, Class=Video, Driver=uvcvideo, 480M
+    |__ Port 002: Dev 003, If 1, Class=Video, Driver=uvcvideo, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/4p, 5000M
+    |__ Port 003: Dev 002, If 0, Class=Vendor Specific Class, Driver=ax_usb_nic, 5000M
+/:  Bus 003.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+Format Video Capture:
+	Width/Height      : 1280/800
+	Pixel Format      : 'MJPG' (Motion-JPEG)
+	Field             : None
+	Bytes per Line    : 0
+	Size Image        : 2048589
+	Colorspace        : sRGB
+	Transfer Function : Default (maps to sRGB)
+	YCbCr/HSV Encoding: Default (maps to ITU-R 601)
+	Quantization      : Default (maps to Full Range)
+	Flags             : 
+Streaming Parameters Video Capture:
+	Capabilities     : timeperframe
+	Frames per second: 120.000 (120/1)
+	Read buffers     : 0
+1
+34dc8db6ea338bf16f50c548a3735797553465b6
+794a51660dbb344fcb47b046bed1588f20f17ac5ad0e3920984b4ab3c6529a02  /opt/photonvision/photonvision_config/models/apriltagV4-yolo11.tflite
+3068b11746b21735760a224f14aed85eca9d8b0efaf55b29f0d82384a1dcf56f  /home/photon/pv-gstreamer-capture-jni/build/libpv_gstreamer_capture_jni.so

@@ -1,0 +1,95 @@
+{
+  "command": "measure",
+  "host": "192.168.4.25:5800",
+  "network": {
+    "ntServerAddress": "8033",
+    "runNTServer": false,
+    "shouldPublishProto": false,
+    "connectionType": 1,
+    "hostname": "photonvision",
+    "networkingDisabled": false
+  },
+  "ntConnectionInfo": {
+    "connected": false
+  },
+  "metrics": {
+    "cpuTemp": 54.812,
+    "cpuUtil": 18.563922942206652,
+    "cpuThr": "",
+    "ramMem": 7607,
+    "ramUtil": 2547,
+    "gpuMem": -1,
+    "gpuMemUtil": -1,
+    "diskUtilPct": 21.52119141259481,
+    "diskUsableSpace": 393481822208,
+    "npuUsage": [],
+    "ipAddress": "",
+    "uptime": 50861,
+    "sentBitRate": -1,
+    "recvBitRate": -1
+  },
+  "activeCameras": [
+    {
+      "nickname": "Arducam_OV9281_USB_Camera (3)",
+      "uniqueName": "b48a6488-54c0-499b-ba84-6591d35a28ba",
+      "enabled": true,
+      "connected": true,
+      "path": "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.3:1.0-video-index0",
+      "currentPipelineIndex": 0,
+      "cameraVideoModeIndex": 0,
+      "videoMode": {
+        "pixelFormat": "MJPEG",
+        "width": 1280,
+        "fps": 120,
+        "height": 800
+      },
+      "exposure": 5000,
+      "brightness": 0,
+      "gain": 40,
+      "decimate": 1,
+      "threads": 2,
+      "refineEdges": true,
+      "decisionMargin": 5,
+      "useMLDetection": true,
+      "mlConfidenceThreshold": 0.67,
+      "mlNmsThreshold": 0.45,
+      "mlRoiPaddingPixels": 40,
+      "model": "apriltag-640-640-yolov11n.engine",
+      "streamingFrameDivisor": 0,
+      "inputShouldShow": false,
+      "outputShouldShow": false,
+      "outputShouldDraw": false
+    }
+  ],
+  "summary": {
+    "b48a6488-54c0-499b-ba84-6591d35a28ba": {
+      "nickname": "Arducam_OV9281_USB_Camera (3)",
+      "resultSamples": 335,
+      "samples": 335,
+      "avgFps": 115.82,
+      "minFps": 83,
+      "p50Fps": 116,
+      "p95Fps": 128,
+      "maxFps": 135,
+      "avgLatencyMs": 27.7,
+      "p50LatencyMs": 27.58,
+      "p95LatencyMs": 33.85,
+      "maxLatencyMs": 37.6,
+      "avgProcessingMs": 9.5,
+      "p50ProcessingMs": 10.9,
+      "p95ProcessingMs": 11.68,
+      "maxProcessingMs": 16.65,
+      "avgCaptureAgeAtPublishMs": 27.71,
+      "p50CaptureAgeAtPublishMs": 27.58,
+      "p95CaptureAgeAtPublishMs": 33.85,
+      "maxCaptureAgeAtPublishMs": 37.6,
+      "avgCaptureEstimatedAgeMs": 18.03,
+      "p50CaptureEstimatedAgeMs": 17.64,
+      "p95CaptureEstimatedAgeMs": 22.63,
+      "maxCaptureEstimatedAgeMs": 24.01,
+      "avgTargets": 1,
+      "targetFrames": 335,
+      "targetRate": 1
+    }
+  }
+}

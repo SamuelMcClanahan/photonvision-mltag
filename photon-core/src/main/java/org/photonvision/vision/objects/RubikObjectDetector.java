@@ -25,13 +25,17 @@ import org.opencv.core.Mat;
 import org.opencv.core.Size;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.common.util.ColorHelper;
 import org.photonvision.rubik.RubikJNI;
+import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
 
 /** Manages an object detector using the rubik backend. */
 public class RubikObjectDetector implements ObjectDetector {
     private static final Logger logger = new Logger(RubikObjectDetector.class, LogGroup.General);
+    private static final boolean ENABLE_GSTREAMER_FRAME_STUB =
+            EnvUtils.flag("PV_RUBIK_ENABLE_GSTREAMER_FRAME_STUB");
 
     private static final Cleaner cleaner = Cleaner.create();
 
@@ -143,6 +147,17 @@ public class RubikObjectDetector implements ObjectDetector {
                 List.of(results).stream()
                         .map(it -> new NeuralNetworkPipeResult(it.rect, it.class_id, it.conf))
                         .toList());
+    }
+
+    @Override
+    public List<NeuralNetworkPipeResult> detect(CVMat in, double nmsThresh, double boxThresh) {
+        if (in.getNativeFrameHandle() != 0 && ENABLE_GSTREAMER_FRAME_STUB) {
+            logger.warn(
+                    "Rubik received a native GStreamer frame, but rubik_jni does not yet expose a"
+                            + " GstBuffer/DMABUF/QNN entrypoint. Falling back to Mat letterbox path.");
+        }
+
+        return detect(in.getMat(), nmsThresh, boxThresh);
     }
 
     /** Thread-safe method to release the detector. */

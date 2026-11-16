@@ -128,6 +128,10 @@ public enum Platform {
         return currentPlatform == LINUX_QCS6490 || Platform.isRubik();
     }
 
+    public static boolean isJetson() {
+        return currentPlatform == LINUX_AARCH64 && isJetsonSBC();
+    }
+
     public static boolean isRaspberryPi() {
         return currentPlatform.isPi;
     }

@@ -24,6 +24,7 @@ import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.raspi.LibCameraJNI;
 import org.photonvision.vision.camera.csi.LibcameraGpuSettables;
 import org.photonvision.vision.frame.Frame;
+import org.photonvision.vision.frame.FrameCaptureMetadata;
 import org.photonvision.vision.frame.FrameProvider;
 import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.opencv.CVMat;
@@ -97,7 +98,8 @@ public class LibcameraGpuFrameProvider extends FrameProvider {
                     colorMat,
                     processedMat,
                     type,
-                    MathUtils.wpiNanoTime() - latency,
+                    FrameCaptureMetadata.simple(
+                            FrameCaptureMetadata.SOURCE_LIBCAMERA_GPU, MathUtils.wpiNanoTime() - latency),
                     settables.getFrameStaticProperties().rotate(settables.getRotation()));
         }
     }

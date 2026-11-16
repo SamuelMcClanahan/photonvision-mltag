@@ -35,7 +35,7 @@ import org.photonvision.common.configuration.NeuralNetworkModelManager.Version;
 public class NeuralNetworkModelsSettings {
     /*
      * The properties of the model. This is used to determine which model to load.
-     * The only families currently supported are RKNN and Rubik (custom .tflite)
+     * The currently supported families are RKNN, Rubik (custom .tflite), and TensorRT.
      */
     public record ModelProperties(
             @JsonProperty("modelPath") Path modelPath,
@@ -69,7 +69,8 @@ public class NeuralNetworkModelsSettings {
         // ============= Migration code from v2025.3.1 ===========
 
         private static Pattern modelPattern =
-                Pattern.compile("^([a-zA-Z0-9._]+)-(\\d+)-(\\d+)-(yolov(?:5|8|11)[nsmlx]*)\\.rknn$");
+                Pattern.compile(
+                        "^([a-zA-Z0-9._]+)-(\\d+)-(\\d+)-(yolov(?:5|8|11)[nsmlx]*)\\.(rknn|engine)$");
 
         static ModelProperties createFromFilename(String modelFileName)
                 throws IllegalArgumentException, IOException {
@@ -79,7 +80,7 @@ public class NeuralNetworkModelsSettings {
 
             // Get the model extension and check if it is supported
             String modelExtension = model.getName().substring(model.getName().lastIndexOf('.'));
-            if (!modelExtension.equals(".rknn")) {
+            if (!modelExtension.equals(".rknn") && !modelExtension.equals(".engine")) {
                 throw new IllegalArgumentException("Model " + modelFileName + " is not a supported format");
             }
 
@@ -95,7 +96,7 @@ public class NeuralNetworkModelsSettings {
             String labelFile = model.getAbsolutePath().replace(backend.get().extension(), "-labels.txt");
             List<String> labels = Files.readAllLines(Paths.get(labelFile));
 
-            String[] parts = parseRKNNName(modelFileName);
+            String[] parts = parseLegacyModelName(modelFileName);
             var version = getModelVersion(parts[3]);
             int width = Integer.parseInt(parts[1]);
             int height = Integer.parseInt(parts[2]);
@@ -107,7 +108,7 @@ public class NeuralNetworkModelsSettings {
                     // all files used to be 640x640
                     width,
                     height,
-                    Family.RKNN,
+                    backend.get(),
                     version);
         }
 
@@ -136,7 +137,7 @@ public class NeuralNetworkModelsSettings {
         }
 
         /**
-         * Parse RKNN name and return the name, width, height, and model type.
+         * Parse a legacy filename and return the name, width, height, and model type.
          *
          * <p>This is static as it is not dependent on the state of the class.
          *
@@ -145,11 +146,15 @@ public class NeuralNetworkModelsSettings {
          * @return an array containing the name, width, height, and model type
          */
         public static String[] parseRKNNName(String modelName) {
+            return parseLegacyModelName(modelName);
+        }
+
+        public static String[] parseLegacyModelName(String modelName) {
             Matcher modelMatcher = modelPattern.matcher(modelName);
 
             if (!modelMatcher.matches()) {
                 throw new IllegalArgumentException(
-                        "Model name must follow the naming convention of name-widthResolution-heightResolution-modelType.rknn");
+                        "Model name must follow the naming convention of name-widthResolution-heightResolution-modelType.rknn or name-widthResolution-heightResolution-modelType.engine");
             }
 
             return new String[] {

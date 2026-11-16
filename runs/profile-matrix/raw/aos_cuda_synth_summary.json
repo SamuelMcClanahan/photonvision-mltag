@@ -1,0 +1,66 @@
+{
+  "streams_detail": [
+    {
+      "stream": "0",
+      "frames": "1164",
+      "fps": "112.017",
+      "avg_capture_ms": "5.88033e-05",
+      "avg_detect_ms": "8.59171",
+      "worst_detect_ms": "20.2089",
+      "hits": "1164/1164"
+    },
+    {
+      "stream": "1",
+      "frames": "1140",
+      "fps": "109.708",
+      "avg_capture_ms": "5.86667e-05",
+      "avg_detect_ms": "8.77817",
+      "worst_detect_ms": "179.157",
+      "hits": "1140/1140"
+    },
+    {
+      "stream": "2",
+      "frames": "1164",
+      "fps": "112.017",
+      "avg_capture_ms": "5.75086e-05",
+      "avg_detect_ms": "8.5925",
+      "worst_detect_ms": "19.8501",
+      "hits": "1164/1164"
+    },
+    {
+      "stream": "3",
+      "frames": "1165",
+      "fps": "112.114",
+      "avg_capture_ms": "5.93004e-05",
+      "avg_detect_ms": "8.59096",
+      "worst_detect_ms": "19.8496",
+      "hits": "1165/1165"
+    },
+    {
+      "stream": "4",
+      "frames": "1163",
+      "fps": "111.921",
+      "avg_capture_ms": "5.88788e-05",
+      "avg_detect_ms": "8.61869",
+      "worst_detect_ms": "26.6275",
+      "hits": "1163/1163"
+    }
+  ],
+  "streams": "5",
+  "frames": "5796",
+  "seconds": "10.3912",
+  "aggregate_fps": "557.778",
+  "avg_capture_ms": "5.86315e-05",
+  "avg_detect_ms": "8.63381",
+  "worst_detect_ms": "179.157",
+  "hits": "5796/5796",
+  "tegrastats_samples": 54,
+  "active_samples": 39,
+  "ram_peak_mb": 3026,
+  "ram_avg_active_mb": 3024.5128205128203,
+  "cpu_avg_active_pct": 25.585470085470085,
+  "gpu_avg_active_pct": 56.41025641025641,
+  "gpu_peak_pct": 61,
+  "process_rss_peak_kb": 1562356,
+  "process_rss_peak_mb": 1525.73828125
+}

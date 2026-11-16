@@ -20,6 +20,7 @@ package org.photonvision.vision.objects;
 import java.util.List;
 import org.opencv.core.Mat;
 import org.photonvision.common.configuration.NeuralNetworkModelManager;
+import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.Releasable;
 import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
 
@@ -57,4 +58,13 @@ public interface ObjectDetector extends Releasable {
      *     empty list if the detector is not initialized or if no objects are detected.
      */
     public List<NeuralNetworkPipeResult> detect(Mat in, double nmsThresh, double boxThresh);
+
+    /**
+     * Detects objects in a managed PhotonVision image. Backends that can use native frame metadata
+     * may override this; the default preserves the existing OpenCV Mat path.
+     */
+    public default List<NeuralNetworkPipeResult> detect(
+            CVMat in, double nmsThresh, double boxThresh) {
+        return detect(in.getMat(), nmsThresh, boxThresh);
+    }
 }

@@ -229,6 +229,17 @@ export const useCameraSettingsStore = defineStore("cameraSettings", {
     ) {
       Object.assign(this.cameras[cameraUniqueName].pipelineSettings, settings);
     },
+    setStreamDemand(cameraUniqueName: string, demandId: string, input: boolean, output: boolean) {
+      const payload = {
+        streamDemand: {
+          cameraUniqueName,
+          demandId,
+          input,
+          output
+        }
+      };
+      useStateStore().websocket?.send(payload);
+    },
     /**
      * Change the nickname of the currently selected pipeline of the provided camera.
      *

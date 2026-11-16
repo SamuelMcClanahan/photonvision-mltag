@@ -25,6 +25,8 @@ import org.photonvision.common.dataflow.events.OutgoingUIEvent;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
 import org.photonvision.common.util.SerializationUtils;
+import org.photonvision.common.util.math.MathUtils;
+import org.photonvision.vision.frame.FrameCaptureMetadata;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
 import org.photonvision.vision.pipeline.result.CalibrationPipelineResult;
 import org.photonvision.vision.pipeline.result.FocusPipelineResult;
@@ -50,6 +52,22 @@ public class UIDataPublisher implements CVPipelineResultConsumer {
         dataMap.put("sequenceID", result.sequenceID);
         dataMap.put("fps", result.fps);
         dataMap.put("latency", result.getLatencyMillis());
+        dataMap.put("processingMs", result.getProcessingMillis());
+        dataMap.put("captureTimestampNanos", result.getImageCaptureTimestampNanos());
+        if (result.inputAndOutputFrame != null && result.inputAndOutputFrame.captureMetadata != null) {
+            FrameCaptureMetadata metadata = result.inputAndOutputFrame.captureMetadata;
+            dataMap.put("captureSource", metadata.source());
+            dataMap.put(
+                    "captureAgeAtPublishMs",
+                    MathUtils.nanosToMillis(
+                            Math.max(0, MathUtils.wpiNanoTime() - metadata.captureTimestampNanos())));
+            dataMap.put(
+                    "captureEstimatedAgeMs",
+                    metadata.estimatedAgeNanos() >= 0
+                            ? MathUtils.nanosToMillis(metadata.estimatedAgeNanos())
+                            : null);
+            dataMap.put("captureNativeSequence", metadata.nativeSequence());
+        }
         var uiTargets = new ArrayList<HashMap<String, Object>>(result.targets.size());
 
         // We don't actually need to send targets during calibration and it can take up a lot (up to

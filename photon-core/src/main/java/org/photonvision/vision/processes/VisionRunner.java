@@ -19,6 +19,7 @@ package org.photonvision.vision.processes;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
@@ -30,12 +31,17 @@ import org.photonvision.common.dataflow.events.OutgoingUIEvent;
 import org.photonvision.common.dataflow.websocket.UIPhotonConfiguration;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
+import org.photonvision.common.util.EnvUtils;
+import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.vision.camera.QuirkyCamera;
 import org.photonvision.vision.frame.Frame;
 import org.photonvision.vision.frame.FrameProvider;
+import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.pipe.impl.HSVPipe;
 import org.photonvision.vision.pipeline.AdvancedPipelineSettings;
+import org.photonvision.vision.pipeline.AprilTagPipelineSettings;
 import org.photonvision.vision.pipeline.CVPipeline;
+import org.photonvision.vision.pipeline.StreamDemand;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
 
 /** VisionRunner has a frame supplier, a pipeline supplier, and a result consumer */
@@ -51,8 +57,20 @@ public class VisionRunner {
     private final QuirkyCamera cameraQuirks;
     private final Supplier<Integer> fpsLimitSupplier;
     private final Supplier<Boolean> enabledSupplier;
+    private final Supplier<StreamDemand> streamDemandSupplier;
 
     private long loopCount;
+    private static final int TIMING_LOG_EVERY =
+            EnvUtils.nonNegativeInteger("PV_VISION_TIMING_LOG_EVERY", 0);
+    private long timingFrames = 0;
+    private long timingSetupNanos = 0;
+    private long timingFrameGetNanos = 0;
+    private long timingPipelineRunNanos = 0;
+    private long timingResultConsumerNanos = 0;
+    private long timingCaptureToPipelineDoneNanos = 0;
+    private long timingCaptureToConsumerDoneNanos = 0;
+    private long timingGStreamerEstimatedAgeNanos = 0;
+    private long timingGStreamerEstimatedAgeSamples = 0;
 
     /**
      * VisionRunner contains a thread to run a pipeline, given a frame, and will give the result to
@@ -74,7 +92,8 @@ public class VisionRunner {
             QuirkyCamera cameraQuirks,
             VisionModuleChangeSubscriber changeSubscriber,
             Supplier<Integer> fpsLimitSupplier,
-            Supplier<Boolean> enabledSupplier) {
+            Supplier<Boolean> enabledSupplier,
+            Supplier<StreamDemand> streamDemandSupplier) {
         this.frameSupplier = frameSupplier;
         this.pipelineSupplier = pipelineSupplier;
         this.pipelineResultConsumer = pipelineResultConsumer;
@@ -82,6 +101,7 @@ public class VisionRunner {
         this.changeSubscriber = changeSubscriber;
         this.fpsLimitSupplier = fpsLimitSupplier;
         this.enabledSupplier = enabledSupplier;
+        this.streamDemandSupplier = streamDemandSupplier;
 
         visionProcessThread = new Thread(this::update);
         visionProcessThread.setName("VisionRunner - " + frameSupplier.getName());
@@ -198,11 +218,20 @@ public class VisionRunner {
             // be doing
             // (pipeline-dependent). I kinda hate how much leak this has...
             // TODO would a callback object be a better fit?
+            long setupStartNanos = System.nanoTime();
+            var settings = pipeline.getSettings();
+            var streamDemand = streamDemandSupplier.get();
             var wantedProcessType = pipeline.getThresholdType();
+            if (wantedProcessType == FrameThresholdType.NONE
+                    && settings instanceof AprilTagPipelineSettings aprilTagSettings
+                    && aprilTagSettings.useMLDetection
+                    && streamDemand.effectiveOutput(settings)) {
+                wantedProcessType = FrameThresholdType.GREYSCALE;
+            }
 
             frameSupplier.requestFrameThresholdType(wantedProcessType);
-            var settings = pipeline.getSettings();
-            if (settings instanceof AdvancedPipelineSettings advanced) {
+            if (wantedProcessType == FrameThresholdType.HSV
+                    && settings instanceof AdvancedPipelineSettings advanced) {
                 var hsvParams =
                         new HSVPipe.HSVParams(
                                 advanced.hsvHue, advanced.hsvSaturation, advanced.hsvValue, advanced.hueInverted);
@@ -210,11 +239,15 @@ public class VisionRunner {
                 frameSupplier.requestHsvSettings(hsvParams);
             }
             frameSupplier.requestFrameRotation(settings.inputImageRotationMode);
-            frameSupplier.requestFrameCopies(settings.inputShouldShow, settings.outputShouldShow);
+            frameSupplier.requestFrameCopies(
+                    streamDemand.effectiveInput(settings), streamDemand.effectiveOutput(settings));
             frameSupplier.requestBlockForFrames(settings.blockForFrames);
+            long setupNanos = System.nanoTime() - setupStartNanos;
 
             // Grab the new camera frame
+            long frameGetStartNanos = System.nanoTime();
             var frame = frameSupplier.get();
+            long frameGetNanos = System.nanoTime() - frameGetStartNanos;
 
             // Frame empty -- no point in trying to do anything more?
             if (frame.processedImage.getMat().empty() && frame.colorImage.getMat().empty()) {
@@ -242,13 +275,85 @@ public class VisionRunner {
                 // a blank frame, otherwise we sleep until the next tick
                 waitUntilNextTick(start);
                 try {
+                    long pipelineRunStartNanos = System.nanoTime();
                     var pipelineResult = pipeline.run(frame, cameraQuirks);
+                    long pipelineRunNanos = System.nanoTime() - pipelineRunStartNanos;
+                    long pipelineDoneNanos = MathUtils.wpiNanoTime();
+                    long resultConsumerStartNanos = System.nanoTime();
                     pipelineResultConsumer.accept(pipelineResult);
+                    long resultConsumerNanos = System.nanoTime() - resultConsumerStartNanos;
+                    long consumerDoneNanos = MathUtils.wpiNanoTime();
+                    recordTiming(
+                            setupNanos,
+                            frameGetNanos,
+                            pipelineRunNanos,
+                            resultConsumerNanos,
+                            frame,
+                            pipelineDoneNanos,
+                            consumerDoneNanos);
                 } catch (Exception ex) {
                     logger.error("Exception on loop " + loopCount, ex);
                 }
                 loopCount++;
             }
+        }
+    }
+
+    private void recordTiming(
+            long setupNanos,
+            long frameGetNanos,
+            long pipelineRunNanos,
+            long resultConsumerNanos,
+            Frame frame,
+            long pipelineDoneNanos,
+            long consumerDoneNanos) {
+        if (TIMING_LOG_EVERY <= 0) {
+            return;
+        }
+
+        timingFrames++;
+        timingSetupNanos += setupNanos;
+        timingFrameGetNanos += frameGetNanos;
+        timingPipelineRunNanos += pipelineRunNanos;
+        timingResultConsumerNanos += resultConsumerNanos;
+        if (frame != null && frame.timestampNanos > 0) {
+            timingCaptureToPipelineDoneNanos += Math.max(0, pipelineDoneNanos - frame.timestampNanos);
+            timingCaptureToConsumerDoneNanos += Math.max(0, consumerDoneNanos - frame.timestampNanos);
+        }
+        if (frame != null
+                && frame.captureMetadata != null
+                && frame.captureMetadata.estimatedAgeNanos() >= 0) {
+            timingGStreamerEstimatedAgeNanos += frame.captureMetadata.estimatedAgeNanos();
+            timingGStreamerEstimatedAgeSamples++;
+        }
+
+        if (timingFrames >= TIMING_LOG_EVERY) {
+            logger.info(
+                    String.format(
+                            Locale.ROOT,
+                            "Vision timing frames=%d setupMs=%.2f frameGetMs=%.2f pipelineMs=%.2f resultConsumerMs=%.2f captureToPipelineDoneMs=%.2f captureToConsumerDoneMs=%.2f gstEstimatedAgeMs=%.2f gstAgeSamples=%d",
+                            timingFrames,
+                            timingSetupNanos / 1_000_000.0 / timingFrames,
+                            timingFrameGetNanos / 1_000_000.0 / timingFrames,
+                            timingPipelineRunNanos / 1_000_000.0 / timingFrames,
+                            timingResultConsumerNanos / 1_000_000.0 / timingFrames,
+                            timingCaptureToPipelineDoneNanos / 1_000_000.0 / timingFrames,
+                            timingCaptureToConsumerDoneNanos / 1_000_000.0 / timingFrames,
+                            timingGStreamerEstimatedAgeSamples > 0
+                                    ? timingGStreamerEstimatedAgeNanos
+                                            / 1_000_000.0
+                                            / timingGStreamerEstimatedAgeSamples
+                                    : -1.0,
+                            timingGStreamerEstimatedAgeSamples));
+            timingFrames = 0;
+            timingSetupNanos = 0;
+            timingFrameGetNanos = 0;
+            timingPipelineRunNanos = 0;
+            timingResultConsumerNanos = 0;
+            timingCaptureToPipelineDoneNanos = 0;
+            timingCaptureToConsumerDoneNanos = 0;
+            timingGStreamerEstimatedAgeNanos = 0;
+            timingGStreamerEstimatedAgeSamples = 0;
         }
     }
 }

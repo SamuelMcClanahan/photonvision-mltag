@@ -1,0 +1,7 @@
+train: /Users/samuelmccanahan/photonvision/qcom_model_export/dataset/train/images
+val: /Users/samuelmccanahan/photonvision/qcom_model_export/dataset/valid/images
+test: /Users/samuelmccanahan/photonvision/qcom_model_export/dataset/test/images
+
+nc: 1
+names:
+  - apriltag

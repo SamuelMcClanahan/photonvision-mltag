@@ -20,8 +20,10 @@ package org.photonvision.vision.processes;
 import io.javalin.websocket.WsContext;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.function.BiConsumer;
 import org.opencv.core.RotatedRect;
 import org.opencv.core.Size;
@@ -39,6 +41,7 @@ import org.photonvision.common.dataflow.websocket.UIPhotonConfiguration;
 import org.photonvision.common.hardware.HardwareManager;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.common.util.SerializationUtils;
 import org.photonvision.vision.calibration.CameraCalibrationCoefficients;
 import org.photonvision.vision.camera.CameraQuirk;
@@ -49,8 +52,11 @@ import org.photonvision.vision.frame.Frame;
 import org.photonvision.vision.frame.consumer.FileSaveFrameConsumer;
 import org.photonvision.vision.frame.consumer.MJPGFrameConsumer;
 import org.photonvision.vision.pipeline.AdvancedPipelineSettings;
+import org.photonvision.vision.pipeline.AprilTagPipelineSettings;
+import org.photonvision.vision.pipeline.CVPipelineSettings;
 import org.photonvision.vision.pipeline.OutputStreamPipeline;
 import org.photonvision.vision.pipeline.ReflectivePipelineSettings;
+import org.photonvision.vision.pipeline.StreamDemand;
 import org.photonvision.vision.pipeline.UICalibrationData;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
 import org.photonvision.vision.target.TargetModel;
@@ -90,6 +96,12 @@ public class VisionModule {
 
     private int fpsLimit = -1;
     private boolean enabled = true;
+    private static final boolean STREAM_REQUIRE_UI_DEMAND =
+            EnvUtils.flag("PV_STREAM_REQUIRE_UI_DEMAND", true);
+    private static final long STREAM_DEMAND_TIMEOUT_NANOS =
+            EnvUtils.nonNegativeInteger("PV_STREAM_DEMAND_TIMEOUT_MS", 2500) * 1_000_000L;
+    private final Object streamDemandLock = new Object();
+    private final HashMap<String, StreamDemandEntry> streamDemandByClient = new HashMap<>();
 
     FileSaveFrameConsumer inputFrameSaver;
     FileSaveFrameConsumer outputFrameSaver;
@@ -140,7 +152,8 @@ public class VisionModule {
                         this.cameraQuirks,
                         getChangeSubscriber(),
                         this::getFPSLimit,
-                        this::getEnabled);
+                        this::getEnabled,
+                        this::getActiveStreamDemand);
         this.streamRunnable = new StreamRunnable(new OutputStreamPipeline());
         changeSubscriberHandle = DataChangeService.getInstance().addSubscriber(changeSubscriber);
 
@@ -237,12 +250,15 @@ public class VisionModule {
 
     private class StreamRunnable extends Thread {
         private final OutputStreamPipeline outputStreamPipeline;
+        private final long streamFramePeriodNs = parseStreamFramePeriodNanos();
 
         private final Object frameLock = new Object();
         private Frame latestFrame;
         private AdvancedPipelineSettings settings = new AdvancedPipelineSettings();
+        private StreamDemand streamDemand = StreamDemand.ALWAYS;
         private List<TrackedTarget> targets = new ArrayList<>();
         private List<RotatedRect> latestMlRois = List.of();
+        private long lastStreamFrameNanos = 0;
 
         private boolean shouldRun = false;
 
@@ -254,7 +270,8 @@ public class VisionModule {
                 Frame inputOutputFrame,
                 AdvancedPipelineSettings settings,
                 List<TrackedTarget> targets,
-                List<RotatedRect> mlDetectionRois) {
+                List<RotatedRect> mlDetectionRois,
+                StreamDemand streamDemand) {
             synchronized (frameLock) {
                 if (shouldRun && this.latestFrame != null) {
                     logger.trace("Fell behind; releasing last unused Mats");
@@ -263,6 +280,7 @@ public class VisionModule {
 
                 this.latestFrame = inputOutputFrame;
                 this.settings = settings;
+                this.streamDemand = streamDemand;
                 this.targets = targets;
                 this.latestMlRois = mlDetectionRois != null ? mlDetectionRois : List.of();
 
@@ -279,6 +297,7 @@ public class VisionModule {
             while (!Thread.interrupted()) {
                 final Frame m_frame;
                 final AdvancedPipelineSettings settings;
+                final StreamDemand streamDemand;
                 final List<TrackedTarget> targets;
                 final List<RotatedRect> mlRois;
                 final boolean shouldRun;
@@ -287,6 +306,7 @@ public class VisionModule {
                     this.latestFrame = null;
 
                     settings = this.settings;
+                    streamDemand = this.streamDemand;
                     targets = this.targets;
                     mlRois = this.latestMlRois;
                     shouldRun = this.shouldRun;
@@ -295,8 +315,11 @@ public class VisionModule {
                 }
                 if (shouldRun) {
                     try {
-                        CVPipelineResult osr = outputStreamPipeline.process(m_frame, settings, targets, mlRois);
-                        consumeResults(m_frame, targets);
+                        if (shouldPublishStreamFrame()) {
+                            CVPipelineResult osr =
+                                    outputStreamPipeline.process(m_frame, settings, targets, mlRois, streamDemand);
+                            consumeResults(m_frame, targets, settings, streamDemand);
+                        }
 
                     } catch (Exception e) {
                         // Never die
@@ -317,6 +340,18 @@ public class VisionModule {
                     }
                 }
             }
+        }
+
+        private boolean shouldPublishStreamFrame() {
+            if (streamFramePeriodNs <= 0) return true;
+
+            long now = System.nanoTime();
+            if (now - lastStreamFrameNanos < streamFramePeriodNs) {
+                return false;
+            }
+
+            lastStreamFrameNanos = now;
+            return true;
         }
     }
 
@@ -592,6 +627,7 @@ public class VisionModule {
         ret.mismatch = this.mismatch;
 
         ret.fpsLimit = this.fpsLimit;
+        ret.isEnabled = this.enabled;
 
         // TODO refactor into helper method
         var temp = new HashMap<Integer, HashMap<String, Object>>();
@@ -696,15 +732,48 @@ public class VisionModule {
         if (result.inputAndOutputFrame != null
                 && (pipelineManager.getCurrentPipelineSettings()
                         instanceof AdvancedPipelineSettings settings)) {
-            streamRunnable.updateData(
-                    result.inputAndOutputFrame, settings, result.targets, result.mlDetectionRois);
-            // The streamRunnable manages releasing in this case
+            var streamDemand = getActiveStreamDemand();
+            if (shouldRunStreamPipeline(settings, streamDemand)) {
+                streamRunnable.updateData(
+                        result.inputAndOutputFrame,
+                        settings,
+                        result.targets,
+                        result.mlDetectionRois,
+                        streamDemand);
+                // The streamRunnable manages releasing in this case
+            } else {
+                result.release();
+            }
         } else {
-            consumeResults(result.inputAndOutputFrame, result.targets);
-
+            var settings = pipelineManager.getCurrentPipelineSettings();
+            var streamDemand = getActiveStreamDemand();
+            if (result.inputAndOutputFrame != null
+                    && (streamDemand.effectiveInput(settings) || streamDemand.effectiveOutput(settings))) {
+                consumeResults(result.inputAndOutputFrame, result.targets, settings, streamDemand);
+            }
             result.release();
             // In this case we don't bother with a separate streaming thread and we release
         }
+    }
+
+    private static boolean shouldRunStreamPipeline(
+            AdvancedPipelineSettings settings, StreamDemand streamDemand) {
+        if (settings instanceof AprilTagPipelineSettings aprilTagSettings
+                && aprilTagSettings.useMLDetection
+                && !streamDemand.effectiveInput(settings)
+                && !streamDemand.effectiveOutput(settings)) {
+            return false;
+        }
+        return streamDemand.anyEffective(settings);
+    }
+
+    private static long parseStreamFramePeriodNanos() {
+        double fps = EnvUtils.positiveDecimal("PV_STREAM_MAX_FPS", -1);
+        if (fps <= 0) {
+            fps = EnvUtils.positiveDecimal("PV_MJPG_MAX_FPS", -1);
+        }
+
+        return fps > 0 ? Math.round(1e9 / fps) : 0;
     }
 
     private void consumePipelineResult(CVPipelineResult result) {
@@ -718,6 +787,108 @@ public class VisionModule {
         for (var c : streamResultConsumers) {
             c.accept(frame, targets);
         }
+    }
+
+    /** Consume stream/target results while respecting which MJPEG streams are visible. */
+    private void consumeResults(
+            Frame frame,
+            List<TrackedTarget> targets,
+            CVPipelineSettings settings,
+            StreamDemand streamDemand) {
+        if (frame == null) return;
+
+        inputFrameSaver.accept(frame.colorImage);
+        outputFrameSaver.accept(frame.processedImage);
+
+        if (streamDemand.effectiveInput(settings)) {
+            inputVideoStreamer.accept(frame.colorImage);
+        }
+        if (streamDemand.effectiveOutput(settings)) {
+            outputVideoStreamer.accept(frame.processedImage);
+        }
+    }
+
+    /** Consume stream/target results while respecting which MJPEG streams are visible. */
+    private void consumeResults(
+            Frame frame,
+            List<TrackedTarget> targets,
+            AdvancedPipelineSettings settings,
+            StreamDemand streamDemand) {
+        consumeResults(frame, targets, (CVPipelineSettings) settings, streamDemand);
+    }
+
+    private record StreamDemandEntry(boolean input, boolean output, long lastHeartbeatNanos) {}
+
+    public void updateStreamDemand(Map<String, Object> demand, WsContext originContext) {
+        if (!STREAM_REQUIRE_UI_DEMAND || originContext == null || demand == null) {
+            return;
+        }
+
+        if (coerceBoolean(demand.get("clearSession"))) {
+            clearStreamDemandForSession(originContext.sessionId());
+            return;
+        }
+
+        var demandId = demand.get("demandId");
+        String key = originContext.sessionId() + ":" + (demandId instanceof String id ? id : "default");
+        boolean input = coerceBoolean(demand.get("input"));
+        boolean output = coerceBoolean(demand.get("output"));
+
+        synchronized (streamDemandLock) {
+            if (input || output) {
+                streamDemandByClient.put(key, new StreamDemandEntry(input, output, System.nanoTime()));
+            } else {
+                streamDemandByClient.remove(key);
+            }
+        }
+    }
+
+    private void clearStreamDemandForSession(String sessionId) {
+        String keyPrefix = sessionId + ":";
+        synchronized (streamDemandLock) {
+            streamDemandByClient.keySet().removeIf(key -> key.startsWith(keyPrefix));
+        }
+    }
+
+    private StreamDemand getActiveStreamDemand() {
+        if (!STREAM_REQUIRE_UI_DEMAND) {
+            return StreamDemand.ALWAYS;
+        }
+
+        long now = System.nanoTime();
+        boolean input = false;
+        boolean output = false;
+        synchronized (streamDemandLock) {
+            Iterator<Map.Entry<String, StreamDemandEntry>> iterator =
+                    streamDemandByClient.entrySet().iterator();
+            while (iterator.hasNext()) {
+                var entry = iterator.next();
+                var demand = entry.getValue();
+                if (now - demand.lastHeartbeatNanos > STREAM_DEMAND_TIMEOUT_NANOS) {
+                    iterator.remove();
+                    continue;
+                }
+                input |= demand.input;
+                output |= demand.output;
+            }
+        }
+        return new StreamDemand(input, output);
+    }
+
+    private static boolean coerceBoolean(Object value) {
+        if (value instanceof Boolean b) {
+            return b;
+        }
+        if (value instanceof Number n) {
+            return n.intValue() != 0;
+        }
+        if (value instanceof String s) {
+            return s.equalsIgnoreCase("true")
+                    || s.equalsIgnoreCase("yes")
+                    || s.equalsIgnoreCase("on")
+                    || s.equals("1");
+        }
+        return false;
     }
 
     public void setTargetModel(TargetModel targetModel) {

@@ -80,6 +80,7 @@ public class DataSocketHandler {
 
     protected void onClose(WsCloseContext context) {
         users.remove(context);
+        clearStreamDemandForContext(context);
         var remote = (InetSocketAddress) context.session.getRemoteAddress();
         // Remote can be null if server is being closed for restart
         if (remote != null) {
@@ -89,6 +90,14 @@ public class DataSocketHandler {
         } else {
             logger.info("Closing websockets for user " + context.sessionId());
         }
+    }
+
+    private void clearStreamDemandForContext(WsContext context) {
+        HashMap<String, Object> clearDemand = new HashMap<>();
+        clearDemand.put("clearSession", true);
+        dcService.publishEvent(
+                new IncomingWebSocketEvent<>(
+                        DataChangeDestination.DCD_ACTIVEMODULE, "streamDemand", clearDemand, null, context));
     }
 
     @SuppressWarnings({"unchecked"})
@@ -261,6 +270,22 @@ public class DataSocketHandler {
                             } else {
                                 logger.warn("Unknown message for PSC: " + data.keySet().iterator().next());
                             }
+                        }
+                        case SMT_STREAMDEMAND -> {
+                            HashMap<String, Object> data = (HashMap<String, Object>) entryValue;
+                            var requestedCameraUniqueName = data.get("cameraUniqueName");
+                            var streamDemandCameraUniqueName =
+                                    requestedCameraUniqueName instanceof String cameraName
+                                            ? cameraName
+                                            : cameraUniqueName;
+
+                            dcService.publishEvent(
+                                    new IncomingWebSocketEvent<>(
+                                            DataChangeDestination.DCD_ACTIVEMODULE,
+                                            "streamDemand",
+                                            data,
+                                            streamDemandCameraUniqueName,
+                                            context));
                         }
                         case SMT_CHANGEPIPELINETYPE ->
                                 dcService.publishEvent(

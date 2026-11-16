@@ -19,11 +19,13 @@ package org.photonvision.vision.frame.provider;
 
 import org.photonvision.common.util.numbers.IntegerCouple;
 import org.photonvision.vision.frame.Frame;
+import org.photonvision.vision.frame.FrameCaptureMetadata;
 import org.photonvision.vision.frame.FrameProvider;
 import org.photonvision.vision.frame.FrameStaticProperties;
 import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.ImageRotationMode;
+import org.photonvision.vision.opencv.MatPool;
 import org.photonvision.vision.pipe.impl.GrayscalePipe;
 import org.photonvision.vision.pipe.impl.HSVPipe;
 import org.photonvision.vision.pipe.impl.RotateImagePipe;
@@ -32,21 +34,35 @@ public abstract class CpuImageProcessor extends FrameProvider {
     protected static class CapturedFrame {
         CVMat colorImage;
         FrameStaticProperties staticProps;
-        long captureTimestamp;
+        FrameCaptureMetadata captureMetadata;
 
         public CapturedFrame(
                 CVMat colorImage, FrameStaticProperties staticProps, long captureTimestampNanos) {
+            this(colorImage, staticProps, FrameCaptureMetadata.unknown(captureTimestampNanos));
+        }
+
+        public CapturedFrame(
+                CVMat colorImage, FrameStaticProperties staticProps, FrameCaptureMetadata captureMetadata) {
             this.colorImage = colorImage;
             this.staticProps = staticProps;
-            this.captureTimestamp = captureTimestampNanos;
+            this.captureMetadata = captureMetadata;
+        }
+
+        public long captureTimestampNanos() {
+            return captureMetadata != null ? captureMetadata.captureTimestampNanos() : 0;
         }
     }
 
     private final HSVPipe m_hsvPipe = new HSVPipe();
     private final RotateImagePipe m_rImagePipe = new RotateImagePipe();
     private final GrayscalePipe m_grayPipe = new GrayscalePipe();
+    private final MatPool m_outputMatPool = new MatPool();
     FrameThresholdType m_processType;
     boolean m_blockForFrames = true;
+    private boolean m_copyInput = true;
+    private boolean m_copyOutput = true;
+    private ImageRotationMode m_rotationMode = ImageRotationMode.DEG_0;
+    private long m_lastEmptyInputPrintNanos = 0;
 
     private final Object m_mutex = new Object();
 
@@ -70,18 +86,26 @@ public abstract class CpuImageProcessor extends FrameProvider {
         CVMat outputMat = null;
         if (!input.colorImage.getMat().empty()) {
             if (m_processType == FrameThresholdType.HSV) {
-                var hsvResult = m_hsvPipe.run(input.colorImage.getMat());
-                outputMat = new CVMat(hsvResult.output);
+                outputMat = m_outputMatPool.take();
+                m_hsvPipe.processInto(input.colorImage.getMat(), outputMat.getMat());
             } else if (m_processType == FrameThresholdType.GREYSCALE) {
-                var result = m_grayPipe.run(input.colorImage.getMat());
-                outputMat = new CVMat(result.output);
+                if (input.colorImage.getMat().channels() == 1 && !m_copyInput) {
+                    outputMat = new CVMat(input.colorImage.getMat(), null, false);
+                } else {
+                    outputMat = m_outputMatPool.take();
+                    m_grayPipe.processInto(input.colorImage.getMat(), outputMat.getMat());
+                }
             } else {
                 outputMat = new CVMat();
             }
 
             ++sequenceID;
         } else {
-            System.out.println("Input was empty!");
+            long now = System.nanoTime();
+            if (now - m_lastEmptyInputPrintNanos >= 1_000_000_000L) {
+                System.out.println("Input was empty!");
+                m_lastEmptyInputPrintNanos = now;
+            }
             outputMat = new CVMat();
         }
 
@@ -90,7 +114,7 @@ public abstract class CpuImageProcessor extends FrameProvider {
                 input.colorImage,
                 outputMat,
                 m_processType,
-                input.captureTimestamp,
+                input.captureMetadata,
                 input.staticProps != null
                         ? input.staticProps.rotate(m_rImagePipe.getParams().rotation())
                         : input.staticProps);
@@ -99,6 +123,9 @@ public abstract class CpuImageProcessor extends FrameProvider {
     @Override
     public void requestFrameThresholdType(FrameThresholdType type) {
         synchronized (m_mutex) {
+            if (this.m_processType == type) {
+                return;
+            }
             this.m_processType = type;
         }
     }
@@ -106,6 +133,10 @@ public abstract class CpuImageProcessor extends FrameProvider {
     @Override
     public void requestFrameRotation(ImageRotationMode rotationMode) {
         synchronized (m_mutex) {
+            if (this.m_rotationMode == rotationMode) {
+                return;
+            }
+            this.m_rotationMode = rotationMode;
             m_rImagePipe.setParams(new RotateImagePipe.RotateImageParams(rotationMode));
         }
     }
@@ -119,7 +150,10 @@ public abstract class CpuImageProcessor extends FrameProvider {
 
     @Override
     public void requestFrameCopies(boolean copyInput, boolean copyOutput) {
-        // We don't actually do zero-copy, so this method is a no-op
+        synchronized (m_mutex) {
+            m_copyInput = copyInput;
+            m_copyOutput = copyOutput;
+        }
     }
 
     @Override
@@ -127,5 +161,9 @@ public abstract class CpuImageProcessor extends FrameProvider {
         synchronized (m_mutex) {
             this.m_blockForFrames = blockForFrames;
         }
+    }
+
+    protected void releaseProcessorResources() {
+        m_outputMatPool.release();
     }
 }

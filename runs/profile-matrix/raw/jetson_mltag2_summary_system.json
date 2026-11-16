@@ -1,0 +1,13 @@
+{
+  "tegrastats_samples": 164,
+  "cpu_avg_pct": 21.71,
+  "cpu_peak_pct": 48.83,
+  "gpu_avg_pct": 32.54,
+  "gpu_peak_pct": 57,
+  "ram_avg_mb": 2602.5,
+  "ram_peak_mb": 2632,
+  "vdd_in_avg_mw": 11045.2,
+  "java_cpu_avg_pct": 140.57,
+  "java_cpu_peak_pct": 190.0,
+  "java_rss_peak_mb": 845.5
+}

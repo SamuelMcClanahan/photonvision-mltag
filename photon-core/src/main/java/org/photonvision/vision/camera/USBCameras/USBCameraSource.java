@@ -22,10 +22,12 @@ import org.photonvision.common.configuration.CameraConfiguration;
 import org.photonvision.common.hardware.Platform;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.vision.camera.CameraQuirk;
 import org.photonvision.vision.camera.PVCameraInfo.PVUsbCameraInfo;
 import org.photonvision.vision.camera.QuirkyCamera;
 import org.photonvision.vision.frame.FrameProvider;
+import org.photonvision.vision.frame.provider.GStreamerUSBFrameProvider;
 import org.photonvision.vision.frame.provider.USBFrameProvider;
 import org.photonvision.vision.processes.VisionSource;
 import org.photonvision.vision.processes.VisionSourceSettables;
@@ -37,7 +39,7 @@ import org.wpilib.vision.stream.CameraServer;
 public class USBCameraSource extends VisionSource {
     private final Logger logger;
     private final UsbCamera camera;
-    protected GenericUSBCameraSettables settables;
+    protected VisionSourceSettables settables;
     protected FrameProvider usbFrameProvider;
 
     private void onCameraConnected() {
@@ -57,6 +59,28 @@ public class USBCameraSource extends VisionSource {
             logger.error(
                     "USBCameraSource matched to a non-USB camera info?? "
                             + config.matchedCameraInfo.toString());
+        }
+
+        if (gstreamerJniCaptureEnabled()) {
+            camera = null;
+            if (getCameraConfiguration().cameraQuirks == null) {
+                int vid =
+                        (config.matchedCameraInfo instanceof PVUsbCameraInfo cameraInfo)
+                                ? cameraInfo.vendorId
+                                : -1;
+                int pid =
+                        (config.matchedCameraInfo instanceof PVUsbCameraInfo cameraInfo)
+                                ? cameraInfo.productId
+                                : -1;
+
+                getCameraConfiguration().cameraQuirks =
+                        QuirkyCamera.getQuirkyCamera(vid, pid, config.matchedCameraInfo.name());
+            }
+
+            settables = new GStreamerUSBCameraSettables(config);
+            logger.info("Created native GStreamer USB settables " + settables);
+            usbFrameProvider = new GStreamerUSBFrameProvider(settables, this::onCameraConnected);
+            return;
         }
 
         camera = new UsbCamera(config.nickname, config.getDevicePath());
@@ -163,15 +187,21 @@ public class USBCameraSource extends VisionSource {
      * a new settables
      */
     public void remakeSettables() {
+        if (camera == null || !(settables instanceof GenericUSBCameraSettables)) {
+            logger.warn("GStreamer USB benchmark path does not support rebuilding USB settables");
+            return;
+        }
+
         var oldConfig = this.cameraConfiguration;
         var oldCamera = this.camera;
 
         // Re-create settables
         var oldVideoMode = this.settables.getCurrentVideoMode();
-        this.settables = createSettables(oldConfig, oldCamera);
+        var newSettables = createSettables(oldConfig, oldCamera);
+        this.settables = newSettables;
 
         // Settables only cache videomodes on connect - force this to happen next tick
-        if (settables.camera.isConnected()) {
+        if (newSettables.camera.isConnected()) {
             this.settables.onCameraConnected();
         } else {
             this.usbFrameProvider.cameraPropertiesCached = false;
@@ -185,6 +215,10 @@ public class USBCameraSource extends VisionSource {
     }
 
     private void printCameraProperaties() {
+        if (camera == null) {
+            return;
+        }
+
         VideoProperty[] cameraProperties = null;
         try {
             cameraProperties = camera.enumerateProperties();
@@ -242,10 +276,14 @@ public class USBCameraSource extends VisionSource {
 
     @Override
     public void release() {
-        CameraServer.removeCamera(camera.getName());
-        camera.close();
-        usbFrameProvider.release();
-        usbFrameProvider = null;
+        if (camera != null) {
+            CameraServer.removeCamera(camera.getName());
+            camera.close();
+        }
+        if (usbFrameProvider != null) {
+            usbFrameProvider.release();
+            usbFrameProvider = null;
+        }
     }
 
     @Override
@@ -279,5 +317,9 @@ public class USBCameraSource extends VisionSource {
                 usbFrameProvider,
                 cameraConfiguration,
                 getCameraConfiguration().cameraQuirks);
+    }
+
+    private static boolean gstreamerJniCaptureEnabled() {
+        return EnvUtils.flag("PV_USB_GSTREAMER_JNI_CAPTURE");
     }
 }

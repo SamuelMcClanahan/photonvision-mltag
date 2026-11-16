@@ -33,7 +33,7 @@ const cameraViewType = computed<number[]>({
       ret.push(1);
     }
 
-    if (ret.length === 0) return [0];
+    if (ret.length === 0) return [1];
 
     return ret;
   },

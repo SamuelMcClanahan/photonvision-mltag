@@ -26,6 +26,7 @@ import org.photonvision.common.dataflow.CVPipelineResultConsumer;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
 import org.photonvision.common.networktables.NTTopicSet;
+import org.photonvision.common.util.EnvUtils;
 import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.targeting.PhotonPipelineResult;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
@@ -38,6 +39,7 @@ import org.wpilib.networktables.NetworkTablesJNI;
 
 public class NTDataPublisher implements CVPipelineResultConsumer {
     private final Logger logger = new Logger(NTDataPublisher.class, LogGroup.General);
+    private static final boolean FLUSH_EVERY_RESULT = parseFlushEveryResult();
 
     private final NetworkTable rootTable = NetworkTablesManager.getInstance().kRootTable;
 
@@ -266,7 +268,15 @@ public class NTDataPublisher implements CVPipelineResultConsumer {
 
         ts.heartbeatPublisher.set(acceptedResult.sequenceID);
 
-        // TODO...nt4... is this needed?
-        rootTable.getInstance().flush();
+        // For high-rate pipelines, forcing a synchronous NT flush from the vision thread every
+        // frame can consume part of the camera/processing budget. Leave the upstream behavior as
+        // the default, but allow Jetson benchmarking to rely on NT's normal background publishing.
+        if (FLUSH_EVERY_RESULT) {
+            rootTable.getInstance().flush();
+        }
+    }
+
+    private static boolean parseFlushEveryResult() {
+        return EnvUtils.flag("PV_NT_FLUSH_EVERY_RESULT", true);
     }
 }
