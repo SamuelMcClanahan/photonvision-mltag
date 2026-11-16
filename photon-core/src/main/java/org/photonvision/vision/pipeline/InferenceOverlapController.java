@@ -33,12 +33,14 @@ package org.photonvision.vision.pipeline;
  * </ul>
  *
  * <p>The controller starts in SERIAL mode. It goes to OVERLAP mode when the vision thread has no
- * idle time between calls (the camera is faster than the pipeline) and the inference is the larger
- * part of the work. In OVERLAP mode it increases the depth until the result of the oldest frame is
- * ready when the next camera frame arrives. It goes back to SERIAL mode when the measured camera
- * frame period shows that the SERIAL mode can keep the camera rate. To go back, the pipeline must
- * skip the input of one camera frame for each frame that is in work, because one call can give only
- * one result.
+ * idle time between calls (the camera is faster than the pipeline) and OVERLAP gives 15% or more
+ * results than SERIAL mode. In OVERLAP mode it increases the depth until the result of the oldest
+ * frame is ready when the next camera frame arrives, but not above the number of lanes when one
+ * stage is slower than the camera. It decreases the depth when a smaller depth is sufficient for a
+ * long time. It goes back to SERIAL mode when the measured camera frame period shows that the
+ * SERIAL mode can keep the camera rate, or when the idle time before each call is long (a low call
+ * rate). When more frames are in work than the mode wants, the pipeline must skip the input of one
+ * camera frame for each frame too many, because one call can give only one result.
  *
  * <p>All times are in nanoseconds. This class has no connection to frames or models, so a test can
  * give it simulated times.
@@ -65,6 +67,24 @@ final class InferenceOverlapController {
     /** Number of calls in sequence that show that SERIAL mode is sufficient before OVERLAP stops. */
     static final int CALLS_TO_STOP_OVERLAP = 60;
 
+    /**
+     * Number of calls in sequence with a long idle time (above 1.5 x the work) before OVERLAP stops.
+     * Such idle times show a low call rate, at which each result of OVERLAP is depth calls old.
+     */
+    static final int CALLS_TO_STOP_OVERLAP_ON_LONG_IDLE = 4;
+
+    /**
+     * Number of calls in sequence that show that a smaller depth is sufficient before it decreases.
+     * This is 10 s at 60 FPS: each step down skips one camera frame, so it must not occur often.
+     */
+    static final int CALLS_TO_REMOVE_DEPTH = 600;
+
+    /**
+     * The depth decreases only when the work is this part of a camera frame period below the limit
+     * for an increase of the smaller depth. This keeps the depth from going up and down.
+     */
+    static final double DEPTH_DOWN_MARGIN = 0.1;
+
     /** A time between two frames above this value is a pause, not a frame period. */
     static final long MAX_FRAME_PERIOD_NANOS = 500_000_000L;
 
@@ -90,14 +110,19 @@ final class InferenceOverlapController {
     private final double reserve;
 
     private boolean overlap = false;
-    private boolean leavingOverlap = false;
     private int depth = 1;
+
+    /** True when the lanes or the work thread are slower than the camera. */
+    private boolean stageIsLimit = false;
 
     private long lastCallEndNanos = 0;
     private long lastFrameTimestampNanos = 0;
     private int lowIdleStreak = 0;
+    private int longIdleStreak = 0;
     private int serialSufficientStreak = 0;
     private int moreDepthStreak = 0;
+    private int lessDepthStreak = 0;
+    private int aboveLimitStreak = 0;
 
     // The last times between two input frames. The camera frame period is the lower quartile of
     // these times: when frames are skipped, a part of the times is two or more periods, and the
@@ -159,36 +184,50 @@ final class InferenceOverlapController {
 
         double workNanos = inferenceAverageNanos + postInferenceAverage;
 
-        if (leavingOverlap) {
-            if (pendingFrames > 0) {
-                return Action.SKIP_INPUT;
-            }
-            leavingOverlap = false;
-            overlap = false;
-            lowIdleStreak = 0;
-        }
-
         if (!overlap) {
-            // A camera that became faster makes the known period invalid.
-            double cameraPeriod = estimateCameraPeriod();
-            if (knownCameraPeriod > 0 && cameraPeriod > 0 && cameraPeriod < 0.8 * knownCameraPeriod) {
+            // A camera that became faster makes the known period invalid. Three frame times of one
+            // camera period are sufficient to show this: in SERIAL mode most of the frame times can
+            // be two periods, so the lower quartile can stay at the old period. Three samples (not
+            // one) keep the test safe against one timestamp with jitter.
+            double shortPeriod = shortFramePeriod();
+            if (knownCameraPeriod > 0 && shortPeriod > 0 && shortPeriod < 0.8 * knownCameraPeriod) {
                 knownCameraPeriod = 0;
             }
 
-            lowIdleStreak = idleNanos >= 0 && idleNanos < LOW_IDLE_NANOS ? lowIdleStreak + 1 : 0;
-            boolean inferenceIsLargerPart =
-                    inferenceSamples >= CALLS_TO_START_OVERLAP && inferenceAverageNanos >= 0.5 * workNanos;
+            // While frames stay in work, the calls return finished results and have no idle time.
+            // That is not a sign of a slow pipeline, so these calls do not count.
+            boolean lowIdle = pendingFrames == 0 && idleNanos >= 0 && idleNanos < LOW_IDLE_NANOS;
+            lowIdleStreak = lowIdle ? lowIdleStreak + 1 : 0;
+            // OVERLAP gives one result for each period of its slowest stage (the lanes or the work
+            // thread). It must give 15% or more results than SERIAL mode, else the change is not
+            // worth the latency.
+            boolean overlapIncreasesRate =
+                    inferenceSamples >= CALLS_TO_START_OVERLAP
+                            && workNanos >= 1.15 * Math.max(postInferenceAverage, inferenceAverageNanos / lanes);
             boolean serialIsSufficient = knownCameraPeriod > 0 && workNanos < 0.9 * knownCameraPeriod;
-            if (lowIdleStreak >= CALLS_TO_START_OVERLAP && inferenceIsLargerPart && !serialIsSufficient) {
+            if (lowIdleStreak >= CALLS_TO_START_OVERLAP && overlapIncreasesRate && !serialIsSufficient) {
                 overlap = true;
                 depth = 1;
                 serialSufficientStreak = 0;
                 moreDepthStreak = 0;
+                lessDepthStreak = 0;
+                aboveLimitStreak = 0;
+                longIdleStreak = 0;
+                stageIsLimit = false;
                 // The frame period from SERIAL mode is the pipeline period. Measure it again.
                 recentFramePeriodCount = 0;
                 recentFramePeriodNext = 0;
             }
         } else {
+            // A long idle time before each call shows that the calls come slower than the work
+            // (for example an FPS limit or a slower camera). In a correct OVERLAP state the idle
+            // time is at most 1.11 x the work, so the factor 1.5 occurs only at a low call rate.
+            // Then each result is depth calls old, so OVERLAP must stop fast. This does not wait
+            // for the lower quartile of the frame times, which needs 24 new samples.
+            boolean longIdle =
+                    idleNanos > 0 && inferenceSamples > 0 && workNanos > 0 && idleNanos > 1.5 * workNanos;
+            longIdleStreak = longIdle ? longIdleStreak + 1 : 0;
+
             // The camera frame period is the lower quartile of the last frame times, not their mean:
             // a pipeline that cannot keep the camera rate does not get each camera frame, so the
             // mean time between its frames is longer than the camera frame period. With the mean, an
@@ -197,41 +236,101 @@ final class InferenceOverlapController {
             boolean serialIsSufficient =
                     cameraPeriod > 0 && inferenceSamples > 0 && workNanos < 0.9 * cameraPeriod;
             serialSufficientStreak = serialIsSufficient ? serialSufficientStreak + 1 : 0;
-            if (serialSufficientStreak >= CALLS_TO_STOP_OVERLAP) {
+            if (longIdleStreak >= CALLS_TO_STOP_OVERLAP_ON_LONG_IDLE) {
+                // The camera period is not known at this rate. When the rate increases again, the
+                // idle time is short and OVERLAP can start again.
+                knownCameraPeriod = 0;
+                stopOverlap();
+            } else if (serialSufficientStreak >= CALLS_TO_STOP_OVERLAP) {
                 knownCameraPeriod = cameraPeriod;
-                serialSufficientStreak = 0;
-                if (pendingFrames > 0) {
-                    leavingOverlap = true;
-                    return Action.SKIP_INPUT;
-                }
-                overlap = false;
-                lowIdleStreak = 0;
+                stopOverlap();
             } else {
-                updateDepth(workNanos);
+                updateDepth(workNanos, inferenceAverageNanos);
             }
         }
 
-        if (overlap && pendingFrames < depth) {
+        // Bring the number of frames in work to the number that the mode wants. This also
+        // corrects a state with more frames in work than wanted (OVERLAP stops, the depth
+        // decreases, or a reset while frames stay in work): one input frame is skipped for each
+        // frame too many, because one call can give only one result.
+        int wanted = overlap ? depth : 0;
+        if (pendingFrames > wanted) {
+            return Action.SKIP_INPUT;
+        }
+        if (pendingFrames < wanted) {
             return Action.DEFER;
         }
         return Action.COMPLETE_OLDEST;
     }
 
+    private void stopOverlap() {
+        overlap = false;
+        lowIdleStreak = 0;
+        serialSufficientStreak = 0;
+        longIdleStreak = 0;
+    }
+
     /**
-     * Increases the depth when the work for one frame is longer than the time that the depth gives.
-     * With a depth of d, the result of a frame is necessary d camera frame periods after its start.
+     * Changes the depth to the smallest value that keeps the camera rate. With a depth of d, the
+     * result of a frame is necessary d camera frame periods after its start.
      */
-    private void updateDepth(double workNanos) {
+    private void updateDepth(double workNanos, double inferenceAverageNanos) {
         double cameraPeriod = estimateCameraPeriod();
-        if (cameraPeriod <= 0 || depth >= MAX_DEPTH) {
+        if (cameraPeriod <= 0) {
             moreDepthStreak = 0;
+            lessDepthStreak = 0;
+            aboveLimitStreak = 0;
             return;
         }
 
-        boolean moreDepthNecessary = workNanos > (depth - reserve) * cameraPeriod;
-        moreDepthStreak = moreDepthNecessary ? moreDepthStreak + 1 : 0;
-        if (moreDepthStreak >= CALLS_TO_ADD_DEPTH) {
-            depth++;
+        // When one stage (the lanes or the work thread) is slower than the camera, that stage
+        // sets the result rate. A depth equal to the number of lanes then gives that rate, and
+        // more depth only adds one stage period of latency for each step. The 0.9 band keeps
+        // this state from changing again and again near the limit.
+        double stagePeriod = Math.max(inferenceAverageNanos / lanes, postInferenceAverage);
+        if (stagePeriod >= cameraPeriod) {
+            stageIsLimit = true;
+        } else if (stagePeriod < 0.9 * cameraPeriod) {
+            stageIsLimit = false;
+        }
+        int depthLimit = stageIsLimit ? Math.min(MAX_DEPTH, lanes) : MAX_DEPTH;
+
+        if (depth < depthLimit) {
+            boolean moreDepthNecessary = workNanos > (depth - reserve) * cameraPeriod;
+            moreDepthStreak = moreDepthNecessary ? moreDepthStreak + 1 : 0;
+            if (moreDepthStreak >= CALLS_TO_ADD_DEPTH) {
+                depth++;
+                moreDepthStreak = 0;
+                lessDepthStreak = 0;
+                aboveLimitStreak = 0;
+                return;
+            }
+        } else {
+            moreDepthStreak = 0;
+        }
+
+        // The depth can be above the limit when a stage became the limit after the depth
+        // increased. Wait some calls, so that one slow frame does not change the depth.
+        aboveLimitStreak = depth > depthLimit ? aboveLimitStreak + 1 : 0;
+        if (aboveLimitStreak >= CALLS_TO_STOP_OVERLAP) {
+            depth--;
+            aboveLimitStreak = 0;
+            moreDepthStreak = 0;
+            lessDepthStreak = 0;
+            return;
+        }
+
+        // A short work peak or a slower camera can leave more depth than necessary, and each
+        // step adds one camera frame period of latency to all later results. The limit is a
+        // margin below the limit for an increase, and many calls in sequence are necessary, so
+        // the depth does not go up and down again and again. Each step down skips one camera
+        // frame one time.
+        boolean lessDepthSufficient =
+                depth > 1 && workNanos < (depth - 1 - reserve - DEPTH_DOWN_MARGIN) * cameraPeriod;
+        lessDepthStreak = lessDepthSufficient ? lessDepthStreak + 1 : 0;
+        if (lessDepthStreak >= CALLS_TO_REMOVE_DEPTH) {
+            depth--;
+            lessDepthStreak = 0;
             moreDepthStreak = 0;
         }
     }
@@ -257,13 +356,16 @@ final class InferenceOverlapController {
     /** Call this when the frames in work were discarded, for example after new settings. */
     void reset() {
         overlap = false;
-        leavingOverlap = false;
         depth = 1;
+        stageIsLimit = false;
         lastCallEndNanos = 0;
         lastFrameTimestampNanos = 0;
         lowIdleStreak = 0;
+        longIdleStreak = 0;
         serialSufficientStreak = 0;
         moreDepthStreak = 0;
+        lessDepthStreak = 0;
+        aboveLimitStreak = 0;
         recentFramePeriodCount = 0;
         recentFramePeriodNext = 0;
         knownCameraPeriod = 0;
@@ -280,6 +382,19 @@ final class InferenceOverlapController {
         System.arraycopy(recentFramePeriods, 0, sortedFramePeriods, 0, recentFramePeriodCount);
         java.util.Arrays.sort(sortedFramePeriods, 0, recentFramePeriodCount);
         return sortedFramePeriods[recentFramePeriodCount / 4];
+    }
+
+    /**
+     * Returns the third smallest of the last times between two input frames. Returns 0 if there are
+     * fewer than 8 samples.
+     */
+    private double shortFramePeriod() {
+        if (recentFramePeriodCount < 8) {
+            return 0;
+        }
+        System.arraycopy(recentFramePeriods, 0, sortedFramePeriods, 0, recentFramePeriodCount);
+        java.util.Arrays.sort(sortedFramePeriods, 0, recentFramePeriodCount);
+        return sortedFramePeriods[2];
     }
 
     private void updateFramePeriod(long frameTimestampNanos) {
