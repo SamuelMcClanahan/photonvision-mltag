@@ -1,0 +1,21 @@
+cppHeaderFileInclude {
+  \.h$
+  \.hpp$
+  \.inc$
+  \.inl$
+}
+
+cppSrcFileInclude {
+  \.cpp$
+}
+
+includeProject {
+  ^photonLib/
+}
+
+includeOtherLibs {
+  ^frc/
+  ^networktables/
+  ^units/
+  ^wpi/
+}
