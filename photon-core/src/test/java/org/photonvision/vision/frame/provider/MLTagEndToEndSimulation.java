@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Random;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
@@ -163,10 +164,12 @@ public class MLTagEndToEndSimulation {
      *
      * @param name Name for the report.
      * @param npuCores Number of inferences that the NPU can run at the same time.
-     * @param inferenceMillis Time of the detect call of the NPU library for one frame.
+     * @param inferenceMillis Mean time of the detect call of the NPU library for one frame.
+     * @param inferenceSpread Standard deviation of the inference time, as a part of the mean.
      * @param lanes Value of PV_MLTAG_INFERENCE_LANES in the run script of the board.
      */
-    private record Board(String name, int npuCores, double inferenceMillis, int lanes) {}
+    private record Board(
+            String name, int npuCores, double inferenceMillis, double inferenceSpread, int lanes) {}
 
     /**
      * Rubik Pi 3 (QCS6490). The AprilTag benchmark of 2026-07-09 measured 5.1 ms for the complete
@@ -174,14 +177,20 @@ public class MLTagEndToEndSimulation {
      * Qualcomm AI Hub gives 3.7 to 4.1 ms for YOLOv11 detection (w8a8) on this NPU. One HTP runs one
      * graph at a time.
      */
-    private static final Board RUBIK = new Board("Rubik Pi 3", 1, 4.6, 1);
+    private static final Board RUBIK = new Board("Rubik Pi 3", 1, 4.6, 0.0, 1);
 
     /**
-     * Orange Pi 5 (RK3588). Published single-core numbers for yolo11n INT8 at 640x640 are 16.7 ms
-     * (Seeed benchmark) and 18.7 ms (Radxa). 3.3 ms is added for the input copy and the output
-     * handling of the JNI library. The NPU has three cores.
+     * Orange Pi 5 (RK3588). The RKNN benchmark of this repository
+     * (docs/source/docs/benchmarks/rknn-model-benchmarks.md) measured 22,989 +/- 2,356 microseconds
+     * for one YOLOv11 inference (int8, 640x640) on an Orange Pi 5, as the mean and the standard
+     * deviation of 5,000 inferences on one NPU core. That measurement had the operator timing on,
+     * which makes an inference slower: other measurements without it give 16.7 ms (Seeed) and 18.7 ms
+     * (Radxa). The simulation uses the larger value and its spread. The NPU has three cores. When
+     * three inferences run at the same time, each one can be slower. A measurement with three YOLOv5s
+     * instances gave 18.8 ms for each instance. PV_MLTAG_SIM_INFERENCE_MS is a list of mean inference
+     * times to find the effect of that.
      */
-    private static final Board ORANGE_PI = new Board("Orange Pi 5", 3, 22.0, 2);
+    private static final Board ORANGE_PI = new Board("Orange Pi 5", 3, 23.0, 0.1025, 2);
 
     @BeforeAll
     public static void init() {
@@ -601,22 +610,30 @@ public class MLTagEndToEndSimulation {
     }
 
     /**
-     * The largest Motion-JPEG frame of the simulated camera. A USB 2.0 camera can send about 400 kB
-     * for each frame at 60 FPS, so its encoder must keep the frames smaller than that.
+     * The largest Motion-JPEG frame of the simulated camera, and the JPEG quality. The frame size of
+     * the real camera is not known. The Motion-JPEG captures of the robot cameras in
+     * runs/jetson-frame-captures (1280x800) have 62 to 78 kB for each frame, which is 61 to 76 kB for
+     * each megapixel. The defaults here give 181 to 349 kB for each 1600x1304 frame, which is 87 to
+     * 167 kB for each megapixel: about two times the data of the real captures, so the JPEG decode
+     * work of the simulation is on the high side. PV_MLTAG_SIM_MAX_JPEG_KB and
+     * PV_MLTAG_SIM_JPEG_QUALITY change the values.
      */
-    private static final int MAX_JPEG_BYTES = 350_000;
+    private static final int MAX_JPEG_BYTES =
+            intList("PV_MLTAG_SIM_MAX_JPEG_KB", new int[] {350})[0] * 1000;
+
+    private static final int JPEG_QUALITY = intList("PV_MLTAG_SIM_JPEG_QUALITY", new int[] {90})[0];
 
     /**
      * Writes a frame as a monochrome UVC camera sends it: YCbCr 4:2:2 Motion-JPEG with neutral
-     * chroma. The quality is 90. For a frame that would be too large, the quality is decreased, as
-     * the rate control of a camera does it. Returns the size of the frame.
+     * chroma. For a frame that would be larger than the limit, the quality is decreased, as the rate
+     * control of a camera does it. Returns the size of the frame.
      */
     private static long writeJpeg(Mat scene, Path file) throws java.io.IOException {
         Mat bgr = new Mat();
         Imgproc.cvtColor(scene, bgr, Imgproc.COLOR_GRAY2BGR);
         MatOfByte encoded = new MatOfByte();
         try {
-            for (int quality : new int[] {90, 85, 80, 75, 70, 65, 60, 50, 40}) {
+            for (int quality = JPEG_QUALITY; quality >= 30; quality -= 5) {
                 assertTrue(
                         Imgcodecs.imencode(
                                 ".jpg",
@@ -932,7 +949,7 @@ public class MLTagEndToEndSimulation {
         SimulatedCamera camera = new SimulatedCamera(capture, properties);
         AprilTagPipeline pipeline =
                 new SimulatedPipeline(
-                        makeSettings(1.0), 1, new SimulatedModel(new SimulatedNpu(1, 0, 0), 1.0));
+                        makeSettings(1.0), 1, new SimulatedModel(new SimulatedNpu(1, 0, 0.0, 0), 1.0));
         int missing = sceneFrames.length;
         long deadline =
                 System.nanoTime() + sceneFrames.length * sleepMicros * 1000L * 5 + 30_000_000_000L;
@@ -1065,10 +1082,13 @@ public class MLTagEndToEndSimulation {
     // ---------------------------------------------------------------------------------------
 
     /**
-     * The CPU time that the NPU library uses for one inference (copy of the input, decode of the
-     * model output, NMS), as milliseconds of this computer. This value is an estimate: it is not
-     * measured on a coprocessor. PV_MLTAG_SIM_NPU_CPU_MS changes it. The thread is busy for this time
-     * and waits for the remaining part of the inference time.
+     * The CPU time that the NPU library uses for one inference (copy of the input, conversion of the
+     * model output, box decode, NMS), as milliseconds of this computer. The default of 2.0 ms is an
+     * upper limit: the same work for a model with one class (copy of 640x640x3 bytes, conversion of
+     * 554,400 output values to float, scan of 8,400 cells, box decode and NMS of 20 to 300
+     * candidates) takes 0.5 to 0.7 ms on the computer where this simulation was made, and 2.0 to 2.3
+     * ms for a model with 80 classes. PV_MLTAG_SIM_NPU_CPU_MS changes it. The thread is busy for this
+     * time and waits for the remaining part of the inference time.
      */
     private static final double NPU_CPU_MILLIS = npuCpuMillis();
 
@@ -1080,17 +1100,29 @@ public class MLTagEndToEndSimulation {
     private static class SimulatedNpu {
         final Semaphore cores;
         final long inferenceNanos;
+        final double spread;
         final long busyNanos;
 
         /**
          * @param cores Number of inferences at the same time.
-         * @param inferenceNanos Time of one inference, with the CPU time of the NPU library.
+         * @param inferenceNanos Mean time of one inference, with the CPU time of the NPU library.
+         * @param spread Standard deviation of the inference time, as a part of the mean.
          * @param busyNanos The part of the inference time where the calling thread uses the CPU.
          */
-        SimulatedNpu(int cores, long inferenceNanos, long busyNanos) {
+        SimulatedNpu(int cores, long inferenceNanos, double spread, long busyNanos) {
             this.cores = new Semaphore(cores, true);
             this.inferenceNanos = inferenceNanos;
+            this.spread = spread;
             this.busyNanos = Math.min(inferenceNanos, busyNanos);
+        }
+
+        /** The time of the next inference: a normal distribution, limited to 0.75 to 1.4 x mean. */
+        long nextInferenceNanos() {
+            if (spread <= 0) {
+                return inferenceNanos;
+            }
+            double factor = 1.0 + spread * ThreadLocalRandom.current().nextGaussian();
+            return Math.round(inferenceNanos * Math.max(0.75, Math.min(1.4, factor)));
         }
     }
 
@@ -1176,7 +1208,7 @@ public class MLTagEndToEndSimulation {
                     }
                     try {
                         long begin = System.nanoTime();
-                        long deadline = begin + npu.inferenceNanos;
+                        long deadline = begin + npu.nextInferenceNanos();
                         // The CPU part of the NPU library: the thread is busy.
                         long busyEnd = begin + npu.busyNanos;
                         long spin = 0;
@@ -1466,6 +1498,7 @@ public class MLTagEndToEndSimulation {
                 new SimulatedNpu(
                         board.npuCores(),
                         Math.round(board.inferenceMillis() * 1e6 / timeScale),
+                        board.inferenceSpread(),
                         Math.round(NPU_CPU_MILLIS * 1e6 * workMultiplier));
 
         // PV_MLTAG_SIM_APP_CPUS=2,3 does what "taskset -c 2,3 java" does for the application: the
@@ -1760,12 +1793,13 @@ public class MLTagEndToEndSimulation {
             reportedLow.append(String.format(Locale.ROOT, "%.1f ", value));
         }
         line(
-                "%-11s cameras=%d cpuSlowdown=%.1f | cameraFps=%.1f resultFps=%s"
+                "%-11s cameras=%d cpuSlowdown=%.1f npuMs=%.1f | cameraFps=%.1f resultFps=%s"
                         + "p99FrameFps=%sp99ReportedFps=%sworstSecondFps=%s| latencyMs p50=%.1f p95=%.1f max=%.1f | decodeMs=%.1f getMs=%.1f runMs=%.1f"
                         + " pipesMs=%.1f | equalToReference=%.2f%% | cpuCoresBusy=%.2f",
                 board.name(),
                 cameras,
                 slowdown,
+                board.inferenceMillis(),
                 o.cameraFps(),
                 fps.toString(),
                 p99.toString(),
@@ -1804,16 +1838,6 @@ public class MLTagEndToEndSimulation {
     }
 
     private static void runBoard(Board defaultBoard) throws Exception {
-        // PV_MLTAG_SIM_INFERENCE_MS replaces the inference time of the board (to find the limit).
-        String inferenceOverride = System.getenv("PV_MLTAG_SIM_INFERENCE_MS");
-        final Board board =
-                inferenceOverride == null || inferenceOverride.isBlank()
-                        ? defaultBoard
-                        : new Board(
-                                defaultBoard.name() + " inferenceMs=" + inferenceOverride.trim(),
-                                defaultBoard.npuCores(),
-                                Double.parseDouble(inferenceOverride.trim()),
-                                defaultBoard.lanes());
         assumeTrue(enabled(), "Set PV_MLTAG_SIM=1 to run the simulation");
         assumeTrue(GStreamerCapture.isAvailable(), "Native GStreamer capture library is not loaded");
         assumeTrue(GStreamerCaptureJNI.hasCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE));
@@ -1826,19 +1850,38 @@ public class MLTagEndToEndSimulation {
                 NPU_CPU_MILLIS,
                 Runtime.getRuntime().availableProcessors());
 
+        // PV_MLTAG_SIM_INFERENCE_MS is a list of mean inference times that replace the time of the
+        // board (to find the limit of the NPU).
+        String inferenceSetting = System.getenv("PV_MLTAG_SIM_INFERENCE_MS");
+        double[] inferenceTimes =
+                inferenceSetting == null || inferenceSetting.isBlank()
+                        ? new double[] {defaultBoard.inferenceMillis()}
+                        : Arrays.stream(inferenceSetting.split(","))
+                                .mapToDouble(value -> Double.parseDouble(value.trim()))
+                                .toArray();
+
         for (double slowdown : slowdowns()) {
             long sleepMicros = calibrateCameraSleepMicros(WORK_MODE ? CAMERA_FPS : CAMERA_FPS * slowdown);
-            for (int cameras : intList("PV_MLTAG_SIM_CAMERAS", new int[] {1, 2})) {
-                Outcome outcome = runScenario(board, cameras, slowdown, sleepMicros);
-                report(board, cameras, slowdown, outcome);
-                // The tag data of each result must be equal to the data of the calm run of the
-                // same frame, also at full load.
-                assertEquals(0, unknownFrames.get(), "The simulated model could not identify a frame");
-                assertEquals(
-                        1.0,
-                        outcome.equalToReferenceFraction(),
-                        1e-12,
-                        "A result is not equal to the reference: " + outcome.firstDifference());
+            for (double inferenceMillis : inferenceTimes) {
+                Board board =
+                        new Board(
+                                defaultBoard.name(),
+                                defaultBoard.npuCores(),
+                                inferenceMillis,
+                                defaultBoard.inferenceSpread(),
+                                defaultBoard.lanes());
+                for (int cameras : intList("PV_MLTAG_SIM_CAMERAS", new int[] {1, 2})) {
+                    Outcome outcome = runScenario(board, cameras, slowdown, sleepMicros);
+                    report(board, cameras, slowdown, outcome);
+                    // The tag data of each result must be equal to the data of the calm run of the
+                    // same frame, also at full load.
+                    assertEquals(0, unknownFrames.get(), "The simulated model could not identify a frame");
+                    assertEquals(
+                            1.0,
+                            outcome.equalToReferenceFraction(),
+                            1e-12,
+                            "A result is not equal to the reference: " + outcome.firstDifference());
+                }
             }
         }
     }

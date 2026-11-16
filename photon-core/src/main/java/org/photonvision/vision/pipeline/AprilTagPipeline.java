@@ -113,6 +113,9 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     // Time of the tag decode and pose work of the last frame. Written by the work thread.
     private volatile long lastPostInferenceNanos = -1;
 
+    // The overlap depth of the last log line. -1 = no log line until now.
+    private int loggedOverlapDepth = -1;
+
     /** A pending frame that is older than this is not completed. Its result has no use. */
     private static final long STALE_PENDING_NANOS = 500_000_000L;
 
@@ -360,6 +363,16 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                         mlHybridPipe.getInferenceNanosAverage(),
                         mlHybridPipe.getInferenceSamples());
 
+        // One log line for each change of the mode, to see on the coprocessor what the pipeline does.
+        int overlapDepth = overlapController.getDepth();
+        if (overlapDepth != loggedOverlapDepth) {
+            logger.info(
+                    overlapDepth == 0
+                            ? "ML AprilTag inference lanes: one frame at a time"
+                            : "ML AprilTag inference lanes: " + overlapDepth + " frames in work");
+            loggedOverlapDepth = overlapDepth;
+        }
+
         if (action == InferenceOverlapController.Action.SKIP_INPUT && !pendingFrames.isEmpty()) {
             // The pipeline goes back to one frame at a time. This call must return an earlier
             // frame, so it cannot also return the input frame.
@@ -432,6 +445,9 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                         > STALE_PENDING_NANOS) {
             awaitResult(pendingFrames.removeFirst()).release();
             discarded = true;
+        }
+        if (discarded) {
+            logger.warn("ML AprilTag: frames that were in work for too long were discarded");
         }
         if (discarded && overlapController != null) {
             overlapController.reset();

@@ -99,9 +99,6 @@ final class InferenceOverlapController {
     private int serialSufficientStreak = 0;
     private int moreDepthStreak = 0;
 
-    private double framePeriodAverage = 0;
-    private int framePeriodSamples = 0;
-
     // The last times between two input frames. The camera frame period is the lower quartile of
     // these times: when frames are skipped, a part of the times is two or more periods, and the
     // timestamps of a camera have some jitter.
@@ -188,17 +185,20 @@ final class InferenceOverlapController {
                 serialSufficientStreak = 0;
                 moreDepthStreak = 0;
                 // The frame period from SERIAL mode is the pipeline period. Measure it again.
-                framePeriodSamples = 0;
-                framePeriodAverage = 0;
                 recentFramePeriodCount = 0;
                 recentFramePeriodNext = 0;
             }
         } else {
+            // The camera frame period is the lower quartile of the last frame times, not their mean:
+            // a pipeline that cannot keep the camera rate does not get each camera frame, so the
+            // mean time between its frames is longer than the camera frame period. With the mean, an
+            // overloaded pipeline would go back to SERIAL mode, which is slower.
+            double cameraPeriod = estimateCameraPeriod();
             boolean serialIsSufficient =
-                    framePeriodSamples >= 8 && inferenceSamples > 0 && workNanos < 0.9 * framePeriodAverage;
+                    cameraPeriod > 0 && inferenceSamples > 0 && workNanos < 0.9 * cameraPeriod;
             serialSufficientStreak = serialIsSufficient ? serialSufficientStreak + 1 : 0;
             if (serialSufficientStreak >= CALLS_TO_STOP_OVERLAP) {
-                knownCameraPeriod = framePeriodAverage;
+                knownCameraPeriod = cameraPeriod;
                 serialSufficientStreak = 0;
                 if (pendingFrames > 0) {
                     leavingOverlap = true;
@@ -264,8 +264,6 @@ final class InferenceOverlapController {
         lowIdleStreak = 0;
         serialSufficientStreak = 0;
         moreDepthStreak = 0;
-        framePeriodAverage = 0;
-        framePeriodSamples = 0;
         recentFramePeriodCount = 0;
         recentFramePeriodNext = 0;
         knownCameraPeriod = 0;
@@ -288,10 +286,6 @@ final class InferenceOverlapController {
         if (lastFrameTimestampNanos > 0 && frameTimestampNanos > lastFrameTimestampNanos) {
             long period = frameTimestampNanos - lastFrameTimestampNanos;
             if (period < MAX_FRAME_PERIOD_NANOS) {
-                framePeriodAverage =
-                        framePeriodSamples == 0 ? period : framePeriodAverage * 0.8 + period * 0.2;
-                framePeriodSamples++;
-
                 recentFramePeriods[recentFramePeriodNext] = period;
                 recentFramePeriodNext = (recentFramePeriodNext + 1) % recentFramePeriods.length;
                 recentFramePeriodCount = Math.min(recentFramePeriods.length, recentFramePeriodCount + 1);

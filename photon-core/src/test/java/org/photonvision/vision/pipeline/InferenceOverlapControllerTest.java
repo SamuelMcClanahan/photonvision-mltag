@@ -292,6 +292,58 @@ public class InferenceOverlapControllerTest {
     }
 
     @Test
+    public void pipelineThatDoesNotGetEachCameraFrameStaysInOverlap() {
+        // 24 ms of work for a frame and a 60 FPS camera: the overlap is necessary. The vision thread
+        // gets only a part of the camera frames (the times between its frames are one period, then
+        // three periods, again and again), for example because the processor is overloaded. The mean
+        // time between the frames is then 33 ms. That must not look like a slow camera, for which
+        // one frame at a time would be sufficient.
+        final long period = 16_666_667L;
+        final double inference = 20 * MS;
+        final long postInference = 4 * MS;
+        var controller = new InferenceOverlapController(2);
+        long now = 1_000 * MS;
+        long frameTime = now;
+        int pending = 0;
+        int skipped = 0;
+
+        // One frame at a time takes 24 ms for each call, so the vision thread has no idle time.
+        for (int i = 0; i < 40 && !controller.isOverlapActive(); i++) {
+            frameTime = Math.max(frameTime + period, now / period * period);
+            now = Math.max(now, frameTime) + 300_000L;
+            Action action = controller.onFrame(now, frameTime, pending, inference, i);
+            if (action == Action.DEFER) {
+                // The overlap starts: this call gives no result, and its frame stays in work.
+                pending++;
+                controller.onCallEnd(now, -1);
+            } else {
+                assertEquals(Action.COMPLETE_OLDEST, action);
+                now += (long) inference + postInference;
+                controller.onCallEnd(now, postInference);
+            }
+        }
+        assertTrue(controller.isOverlapActive(), "The overlap must start");
+
+        for (int i = 0; i < 600; i++) {
+            frameTime += (i % 2 == 0) ? period : 3 * period;
+            now = frameTime + 300_000L;
+            Action action = controller.onFrame(now, frameTime, pending, inference, 100 + i);
+            if (action == Action.DEFER) {
+                pending++;
+                controller.onCallEnd(now, -1);
+            } else {
+                if (action == Action.SKIP_INPUT) {
+                    skipped++;
+                    pending--;
+                }
+                controller.onCallEnd(now, postInference);
+            }
+        }
+        assertTrue(controller.isOverlapActive(), "The overlap must stay active");
+        assertEquals(0, skipped, "No camera frame can be skipped to go back to one frame at a time");
+    }
+
+    @Test
     public void threeLanesServeAVerySlowModel() {
         // 40 ms inference needs three lanes for a 60 FPS camera. 42 ms of work for a frame is less
         // than three frame periods (50 ms) minus the reserve (5 ms).
