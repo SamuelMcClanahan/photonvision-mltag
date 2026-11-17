@@ -142,16 +142,19 @@ public class RknnObjectDetector implements ObjectDetector {
         }
 
         // Detect objects in the letterboxed frame
-        var results = RknnJNI.detect(objPointer, input.image().getNativeObjAddr(), nmsThresh, boxThresh);
+        var results =
+                RknnJNI.detect(objPointer, input.image().getNativeObjAddr(), nmsThresh, boxThresh);
 
         if (results == null) {
             return List.of();
         }
 
-        return input.scale().resizeDetections(
-                List.of(results).stream()
-                        .map(it -> new NeuralNetworkPipeResult(it.rect, it.class_id, it.conf))
-                        .toList());
+        return input
+                .scale()
+                .resizeDetections(
+                        List.of(results).stream()
+                                .map(it -> new NeuralNetworkPipeResult(it.rect, it.class_id, it.conf))
+                                .toList());
     }
 
     /** Thread-safe method to release the detector. */

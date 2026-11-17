@@ -157,8 +157,7 @@ public class BaseEqualityTest {
                                         pose2,
                                         numbers(p, 1)));
                 case "end" ->
-                        cases.add(
-                                new GoldenCase(image, width, height, atr, calibration, regions, detections));
+                        cases.add(new GoldenCase(image, width, height, atr, calibration, regions, detections));
                 default -> throw new IllegalStateException("Unknown line in the golden file: " + line);
             }
         }
@@ -212,8 +211,7 @@ public class BaseEqualityTest {
      * the other groups run on the shared worker pool.
      */
     private static AprilTagPoseEstimate[] parallelPoses(
-            List<AprilTagDetection> detections, AprilTagPoseEstimatorPipeParams params)
-            throws Exception {
+            List<AprilTagDetection> detections, AprilTagPoseEstimatorPipeParams params) throws Exception {
         AprilTagPoseEstimate[] poses = new AprilTagPoseEstimate[detections.size()];
         if (detections.isEmpty()) {
             return poses;
@@ -259,8 +257,7 @@ public class BaseEqualityTest {
     private static void same(
             List<String> mismatches, String where, String field, double golden, double actual) {
         if (Double.doubleToLongBits(golden) != Double.doubleToLongBits(actual)) {
-            mismatches.add(
-                    where + " " + field + ": golden=" + golden + " actual=" + actual);
+            mismatches.add(where + " " + field + ": golden=" + golden + " actual=" + actual);
         }
     }
 
@@ -287,8 +284,15 @@ public class BaseEqualityTest {
             String tag = where + " tag " + g.id();
             if (g.id() != a.getId() || g.hamming() != a.getHamming()) {
                 mismatches.add(
-                        tag + " id/hamming: golden=" + g.id() + "/" + g.hamming() + " actual="
-                                + a.getId() + "/" + a.getHamming());
+                        tag
+                                + " id/hamming: golden="
+                                + g.id()
+                                + "/"
+                                + g.hamming()
+                                + " actual="
+                                + a.getId()
+                                + "/"
+                                + a.getHamming());
                 continue;
             }
             same(mismatches, tag, "decision margin", g.margin(), a.getDecisionMargin());

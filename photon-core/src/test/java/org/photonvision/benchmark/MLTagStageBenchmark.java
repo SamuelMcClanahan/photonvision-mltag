@@ -314,8 +314,7 @@ public class MLTagStageBenchmark {
                                 Imgproc.cvtColor(input.image(), rgb, Imgproc.COLOR_BGR2RGB);
                                 return null;
                             });
-            String activePath =
-                    scratch.lastWasMonochromeFastPath() ? "fast path" : "base operation";
+            String activePath = scratch.lastWasMonochromeFastPath() ? "fast path" : "base operation";
 
             // The time on a board where the self-check fails (or PV_MLTAG_MONO_MODEL_INPUT=exact):
             // copy to three channels, then the 3-channel letterbox of the helper.

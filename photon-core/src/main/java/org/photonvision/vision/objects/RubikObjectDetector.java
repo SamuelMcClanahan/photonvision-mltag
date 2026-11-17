@@ -146,10 +146,12 @@ public class RubikObjectDetector implements ObjectDetector {
             return List.of();
         }
 
-        return input.scale().resizeDetections(
-                List.of(results).stream()
-                        .map(it -> new NeuralNetworkPipeResult(it.rect, it.class_id, it.conf))
-                        .toList());
+        return input
+                .scale()
+                .resizeDetections(
+                        List.of(results).stream()
+                                .map(it -> new NeuralNetworkPipeResult(it.rect, it.class_id, it.conf))
+                                .toList());
     }
 
     @Override

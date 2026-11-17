@@ -154,11 +154,11 @@ public class Letterbox {
      *
      * <p>A monochrome camera gives a 1-channel frame. A resize of 1 channel followed by a copy to 3
      * channels has one third of the resize work. But an OpenCV build can use different resize code
-     * for 1 and 3 channels (for example a HAL on ARM), and then the bytes can differ. So the fast path
-     * is used only when a self-check on this OpenCV build proved equal bytes for this frame size.
-     * The fast path pads the 1-channel image with the first color value only, so it is used only for
-     * a gray pad color (three equal values). Otherwise the frame is copied to 3 channels first, which
-     * is the base operation.
+     * for 1 and 3 channels (for example a HAL on ARM), and then the bytes can differ. So the fast
+     * path is used only when a self-check on this OpenCV build proved equal bytes for this frame
+     * size. The fast path pads the 1-channel image with the first color value only, so it is used
+     * only for a gray pad color (three equal values). Otherwise the frame is copied to 3 channels
+     * first, which is the base operation.
      *
      * @param in The camera frame with 1 or 3 channels.
      * @param s The scratch images of the caller.
@@ -211,7 +211,8 @@ public class Letterbox {
             double pad1,
             double pad2) {}
 
-    private static final ConcurrentHashMap<ProbeKey, Boolean> probeResults = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<ProbeKey, Boolean> probeResults =
+            new ConcurrentHashMap<>();
 
     /** Number of self-check runs. Tests read it to prove the cache. */
     static final AtomicInteger probeRuns = new AtomicInteger();
@@ -295,8 +296,8 @@ public class Letterbox {
 
     /**
      * Compares the fast path with the base operation on two probe pictures of the frame size. Random
-     * noise shows each difference of a resize coefficient. The blurred picture has smooth areas, which
-     * are like a camera picture.
+     * noise shows each difference of a resize coefficient. The blurred picture has smooth areas,
+     * which are like a camera picture.
      */
     static boolean probeMonochromeResize(
             int width, int height, Size inputSize, Scalar color, MonoFastPath fastPath) {
@@ -361,7 +362,9 @@ public class Letterbox {
                     "Monochrome model input "
                             + sizes
                             + ": the 1-channel resize does not give the same bytes as the base operation ("
-                            + (differentBytes < 0 ? "different size or type" : differentBytes + " different bytes")
+                            + (differentBytes < 0
+                                    ? "different size or type"
+                                    : differentBytes + " different bytes")
                             + "). The 3-channel base operation is used, and it costs more time.");
         }
         return exact;
