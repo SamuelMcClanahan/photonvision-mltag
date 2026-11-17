@@ -268,11 +268,6 @@ void applyRealtimePriorityToCurrentThread(const char* threadName) {
   }
 }
 
-jlong steadyNowNanos() {
-  const auto now = std::chrono::steady_clock::now().time_since_epoch();
-  return static_cast<jlong>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-}
-
 // ---------------------------------------------------------------------------------------------
 // Pixel buffer pool. Decoded frames are large (2 MP and more). Reuse of the buffers prevents a
 // page-fault storm on each frame.
@@ -1650,10 +1645,13 @@ void workerLoop(Capture* capture) {
 jlongArray frameToResult(JNIEnv* env, Capture* capture, FrameHolder* rawHolder) {
   std::unique_ptr<FrameHolder, void (*)(FrameHolder*)> holder(rawHolder, discardFrameHolder);
 
+  // One clock read for the age and for the pull time stamp. Java computes the capture time as
+  // pull time minus age, so a second, later read would make the capture time too new.
+  const int64_t pullNanos = monoNanos();
   jlong estimatedAge = -1;
   if (holder->captureMonoNanos >= 0) {
     estimatedAge =
-        static_cast<jlong>(std::max<int64_t>(0, monoNanos() - holder->captureMonoNanos));
+        static_cast<jlong>(std::max<int64_t>(0, pullNanos - holder->captureMonoNanos));
     capture->stats.ageSamples.fetch_add(1, std::memory_order_relaxed);
     capture->stats.ageNanosSum.fetch_add(estimatedAge, std::memory_order_relaxed);
     atomicMax(capture->stats.ageNanosMax, estimatedAge);
@@ -1673,7 +1671,7 @@ jlongArray frameToResult(JNIEnv* env, Capture* capture, FrameHolder* rawHolder) 
       holder->ptsNanos,
       holder->dtsNanos,
       holder->durationNanos,
-      steadyNowNanos(),
+      static_cast<jlong>(pullNanos),
       static_cast<jlong>(++capture->sequence),
       holder->mlBuffer != nullptr ? gstTimeToJlong(GST_BUFFER_PTS(holder->mlBuffer))
                                   : static_cast<jlong>(-1),

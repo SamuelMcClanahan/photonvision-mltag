@@ -18,6 +18,7 @@
 package org.photonvision.gstreamer;
 
 import org.opencv.core.Mat;
+import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.vision.frame.FrameCaptureMetadata;
 import org.photonvision.vision.opencv.CVMat;
 
@@ -69,11 +70,18 @@ public record GStreamerFrame(
                 nativeFrameHandle);
     }
 
-    public FrameCaptureMetadata toCaptureMetadata(String source, long fallbackTimestampNanos) {
-        long captureTimestampNanos =
+    /**
+     * Makes the capture metadata. The capture time comes only from native clock values, so a JVM
+     * pause after grab() returns does not change it.
+     */
+    public FrameCaptureMetadata toCaptureMetadata(String source) {
+        // The native capture time on the monotonic clock. Without a known age the pull time is the
+        // best value that we have.
+        long nativeCaptureNanos =
                 estimatedAgeNanos >= 0
-                        ? fallbackTimestampNanos - estimatedAgeNanos
-                        : fallbackTimestampNanos;
+                        ? nativePullTimestampNanos - estimatedAgeNanos
+                        : nativePullTimestampNanos;
+        long captureTimestampNanos = nativeCaptureNanos + monotonicToWpiOffsetNanos();
 
         return FrameCaptureMetadata.gstreamer(
                 source,
@@ -87,5 +95,34 @@ public record GStreamerFrame(
                 mlBufferPtsNanos,
                 mlBufferDtsNanos,
                 mlBufferDurationNanos);
+    }
+
+    /** Two reads of System.nanoTime() farther apart than this show a pause between the reads. */
+    private static final long MAX_OFFSET_READ_GAP_NANOS = 1_000_000L;
+
+    private static final int MAX_OFFSET_READS = 5;
+
+    /**
+     * The WPILib time minus the monotonic clock. On Linux System.nanoTime() reads CLOCK_MONOTONIC,
+     * the clock of the native library. A pause between the reads would move the offset, so the
+     * WPILib read is between two monotonic reads and a pair with a large gap is read again.
+     */
+    static long monotonicToWpiOffsetNanos() {
+        long bestOffset = 0;
+        long bestGap = Long.MAX_VALUE;
+        for (int i = 0; i < MAX_OFFSET_READS; i++) {
+            long before = System.nanoTime();
+            long wpi = MathUtils.wpiNanoTime();
+            long after = System.nanoTime();
+            long gap = after - before;
+            if (gap < bestGap) {
+                bestGap = gap;
+                bestOffset = wpi - (before + gap / 2);
+            }
+            if (gap <= MAX_OFFSET_READ_GAP_NANOS) {
+                break;
+            }
+        }
+        return bestOffset;
     }
 }

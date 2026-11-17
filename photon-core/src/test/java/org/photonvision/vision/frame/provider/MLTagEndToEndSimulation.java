@@ -19,6 +19,8 @@ package org.photonvision.vision.frame.provider;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -27,8 +29,10 @@ import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
@@ -78,6 +82,7 @@ import org.photonvision.vision.opencv.ImageRotationMode;
 import org.photonvision.vision.opencv.OpenCVThreadSetting;
 import org.photonvision.vision.pipe.impl.AprilTagROIDecodePipe.ROIDecodeParams;
 import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
+import org.photonvision.vision.pipe.impl.VisionWorkerPool;
 import org.photonvision.vision.pipeline.AprilTagPipeline;
 import org.photonvision.vision.pipeline.AprilTagPipelineSettings;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
@@ -113,7 +118,11 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * start at different frames of the set.
  *
  * <p>Before the load runs, a calm run (slow camera, one frame at a time) records the tag data of
- * each frame. Each result of a load run must be equal to the recorded data of its frame.
+ * each frame, with the pose iteration count of each load run. Each result of a load run must be
+ * equal to the recorded data of its frame: the ID, the corners and the pose of each tag. The
+ * comparison starts with the first result, so it includes the warm-up, where the pipeline changes
+ * its inference mode. Each result must also have the capture time and the sequence ID of its own
+ * frame, and the capture times of the results must increase.
  *
  * <p>The CPU of a coprocessor is slower than the CPU of a development computer. The simulation
  * models a CPU that is k times slower with time scaling: the camera runs at 60 x k FPS and the NPU
@@ -142,7 +151,17 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * value of k. The time scaling mode does not use it, because there all work has the same factor k.
  *
  * <p>The run scripts set PV_OPENCV_THREADS=1 and PV_GSTREAMER_CAPTURE_RT_PRIORITY=10. Use the same
- * settings for the simulation. The real-time priority needs root or CAP_SYS_NICE.
+ * settings for the simulation. The real-time priority needs root or CAP_SYS_NICE. If the kernel
+ * refuses it, the simulation fails.
+ *
+ * <p>The test JVM must have exactly the CPUs of the board (4), because the number of CPUs changes
+ * the number of parallel groups of the tag decode and the pose estimation, and the competition for
+ * the CPUs. The simulation fails if the count is different. Set PV_MLTAG_SIM_ALLOW_CPU_COUNT=1 to
+ * run anyway: then each report line says that it is not valid for the board. The run scripts use
+ * "taskset -c 4-7", so on a computer with more CPUs start Gradle with taskset and with no daemon. A
+ * Gradle daemon that already runs keeps its own CPU mask, and the test JVM gets that mask.
+ * PV_MLTAG_SIM_APP_CPUS=2,3 gives the CPU mask only to the threads of the application. It does not
+ * move the GC and JIT threads of the JVM. taskset on the JVM moves all threads.
  *
  * <p>The report gives for each camera: the mean result rate (resultFps), the rate that 99% of the
  * times between two results are better than (p99FrameFps), the lowest value in 100 of the FPS value
@@ -150,11 +169,15 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * window of one second (worstSecondFps).
  *
  * <pre>
+ * ./gradlew --stop
  * PV_MLTAG_SIM=1 PV_MLTAG_SIM_MODE=work PV_MLTAG_SIM_CAMERAS=2 PV_MLTAG_SIM_SECONDS=30 \
  *   PV_OPENCV_THREADS=1 PV_GSTREAMER_CAPTURE_RT_PRIORITY=10 \
  *   PV_GSTREAMER_CAPTURE_JNI_LIB=/path/libpv_gstreamer_capture_jni.so \
- *   ./gradlew :photon-core:test --tests "*MLTagEndToEndSimulation.orangePi5"
+ *   taskset -c 0-3 ./gradlew --no-daemon :photon-core:test \
+ *   --tests "*MLTagEndToEndSimulation.orangePi5"
  * </pre>
+ *
+ * <p>Use 4 CPUs on 4 different physical cores for taskset (see lscpu -e).
  */
 public class MLTagEndToEndSimulation {
     private static final int WIDTH = 1600;
@@ -222,9 +245,15 @@ public class MLTagEndToEndSimulation {
      * @param inferenceMillis Mean time of the detect call of the NPU library for one frame.
      * @param inferenceSpread Standard deviation of the inference time, as a part of the mean.
      * @param lanes Value of PV_MLTAG_INFERENCE_LANES in the run script of the board.
+     * @param cpus Number of CPUs that the run script gives the JVM (taskset).
      */
     private record Board(
-            String name, int npuCores, double inferenceMillis, double inferenceSpread, int lanes) {}
+            String name,
+            int npuCores,
+            double inferenceMillis,
+            double inferenceSpread,
+            int lanes,
+            int cpus) {}
 
     /**
      * Rubik Pi 3 (QCS6490). The AprilTag benchmark of 2026-07-09 measured 5.1 ms for the complete
@@ -232,7 +261,7 @@ public class MLTagEndToEndSimulation {
      * Qualcomm AI Hub gives 3.7 to 4.1 ms for YOLOv11 detection (w8a8) on this NPU. One HTP runs one
      * graph at a time.
      */
-    private static final Board RUBIK = new Board("Rubik Pi 3", 1, 4.6, 0.0, 1);
+    private static final Board RUBIK = new Board("Rubik Pi 3", 1, 4.6, 0.0, 1, 4);
 
     /**
      * Orange Pi 5 (RK3588). The RKNN benchmark of this repository
@@ -245,7 +274,7 @@ public class MLTagEndToEndSimulation {
      * instances gave 18.8 ms for each instance. PV_MLTAG_SIM_INFERENCE_MS is a list of mean inference
      * times to find the effect of that.
      */
-    private static final Board ORANGE_PI = new Board("Orange Pi 5", 3, 23.0, 0.1025, 2);
+    private static final Board ORANGE_PI = new Board("Orange Pi 5", 3, 23.0, 0.1025, 2, 4);
 
     @BeforeAll
     public static void init() {
@@ -281,11 +310,48 @@ public class MLTagEndToEndSimulation {
     private static List<String> sourceNames;
     private static Path frameDirectory;
 
+    /** The pose iteration count of a pipeline with the real CPU work (k = 1). */
+    private static final int BASE_ITERATIONS = 40;
+
     /**
-     * The tag data of each frame from a calm run: a slow camera and a pipeline that completes each
-     * frame before the next frame arrives. Each result of a load run must be equal to this data.
+     * The pose iteration count for a work multiplier. The work mode makes the pose estimation do more
+     * iterations. makeSettings and the reference use this one function, so the two cannot differ.
      */
-    private static List<List<double[]>> referenceTags;
+    private static int iterationsFor(double workMultiplier) {
+        return (int) Math.round(BASE_ITERATIONS * workMultiplier);
+    }
+
+    /**
+     * For each pose iteration count: the tag data of each frame from a calm run (a slow camera and a
+     * pipeline that completes each frame before the next frame arrives). Each result of a load run
+     * must be equal to the data of its iteration count. The pose depends on the iteration count, so
+     * one reference for all counts would make it necessary to skip the pose.
+     */
+    private static final Map<Integer, List<List<double[]>>> referenceByIterations = new HashMap<>();
+
+    /** The CPU count of the JVM before the simulation sets a CPU mask. -1 before the first check. */
+    private static int hostCpus = -1;
+
+    /** The CPU count of the application threads: hostCpus, or the CPUs of PV_MLTAG_SIM_APP_CPUS. */
+    private static int appCpus;
+
+    /** True if PV_MLTAG_SIM_ALLOW_CPU_COUNT=1 let a run continue with the wrong CPU count. */
+    private static boolean cpuCountNotValid;
+
+    /**
+     * The extra JPEG decode percent that the simulation gave the native library last. The library
+     * has no getter, and the value is one setting for the whole process. A test reads this copy to
+     * see that a scenario puts the value back to 0, also after a failure.
+     */
+    private static volatile int activeExtraDecodePercent;
+
+    /** The captures of the last scenario. A test reads it to see that each one was closed. */
+    private static volatile List<GStreamerCapture> lastScenarioCaptures = List.of();
+
+    private static void setExtraDecodePercent(int percent) {
+        GStreamerCaptureJNI.setTestExtraDecodePercent(percent);
+        activeExtraDecodePercent = percent;
+    }
 
     /** Number of frames that the simulated model could not identify. It must stay 0. */
     private static final AtomicInteger unknownFrames = new AtomicInteger();
@@ -882,7 +948,9 @@ public class MLTagEndToEndSimulation {
         sourceNames = names;
         sceneFrames = frames.toArray(new SceneFrame[0]);
 
-        prepareReference();
+        // The tag count does not depend on the pose iterations, so the statistics use the base
+        // reference.
+        List<List<double[]>> baseReference = prepareReference(BASE_ITERATIONS);
 
         // What the frame set contains.
         long minBytes = Long.MAX_VALUE;
@@ -902,7 +970,7 @@ public class MLTagEndToEndSimulation {
             minBoxes = Math.min(minBoxes, frame.boxes().size());
             maxBoxes = Math.max(maxBoxes, frame.boxes().size());
             sumBoxes += frame.boxes().size();
-            int tags = referenceTags.get(i).size();
+            int tags = baseReference.get(i).size();
             minTags = Math.min(minTags, tags);
             maxTags = Math.max(maxTags, tags);
             sumTags += tags;
@@ -942,7 +1010,7 @@ public class MLTagEndToEndSimulation {
                     if (sceneFrames[i].source() == source) {
                         frameCount++;
                         boxes += sceneFrames[i].boxes().size();
-                        tags += referenceTags.get(i).size();
+                        tags += baseReference.get(i).size();
                         bytes += sceneFrames[i].frameBytes();
                     }
                 }
@@ -985,21 +1053,28 @@ public class MLTagEndToEndSimulation {
     }
 
     /**
-     * Compares the tag data of a result with the reference data of the same frame.
+     * Compares the tag data of a result with the reference data of the same frame: all 15 values of
+     * each tag (ID, corners, pose). A NaN value is always a difference, also when the reference has
+     * NaN too: a NaN corner or pose is never a valid result, and a plain comparison with NaN is
+     * false, which would count it as equal.
      *
-     * @param withPose Compare the pose too. Not possible when the load run uses more pose iterations
-     *     than the reference run.
+     * @param reference The reference data of the pose iteration count of the run.
      * @return null if the data is equal, or a text that tells the difference.
      */
-    private static String compareWithReference(int index, List<double[]> tags, boolean withPose) {
-        List<double[]> expected = referenceTags.get(index);
+    static String compareWithReference(
+            List<List<double[]>> reference, int index, List<double[]> tags) {
+        List<double[]> expected = reference.get(index);
+        if (expected == null) {
+            return "frame " + index + ": no reference data";
+        }
         if (expected.size() != tags.size()) {
             return "frame " + index + ": " + tags.size() + " tags, reference " + expected.size();
         }
-        int values = withPose ? 15 : 9;
         for (int tag = 0; tag < tags.size(); tag++) {
-            for (int i = 0; i < values; i++) {
-                if (Math.abs(expected.get(tag)[i] - tags.get(tag)[i]) > 1e-9) {
+            for (int i = 0; i < 15; i++) {
+                double a = expected.get(tag)[i];
+                double b = tags.get(tag)[i];
+                if (Double.isNaN(a) || Double.isNaN(b) || Math.abs(a - b) > 1e-9) {
                     return "frame "
                             + index
                             + " tag "
@@ -1007,21 +1082,34 @@ public class MLTagEndToEndSimulation {
                             + " value "
                             + i
                             + ": "
-                            + tags.get(tag)[i]
+                            + b
                             + ", reference "
-                            + expected.get(tag)[i];
+                            + a;
                 }
             }
         }
         return null;
     }
 
+    /** Makes the reference for an iteration count if it is not there yet. */
+    private static synchronized List<List<double[]>> ensureReference(int numIterations)
+            throws Exception {
+        List<List<double[]>> reference = referenceByIterations.get(numIterations);
+        return reference != null ? reference : prepareReference(numIterations);
+    }
+
     /**
-     * Makes the reference data: a slow camera gives each frame, and a pipeline with one lane and no
-     * NPU wait completes each frame before the next frame arrives. The frames go through the same
-     * capture library (and in the mjpeg format the same JPEG decoder) as in the load runs.
+     * Makes the reference data for a pose iteration count: a slow camera gives each frame, and a
+     * pipeline with one lane and no NPU wait completes each frame before the next frame arrives. The
+     * frames go through the same capture library (and in the mjpeg format the same JPEG decoder) as
+     * in the load runs. Only the iteration count is different from the base settings: the model
+     * gives no duplicate regions and does no extra input preparation, because these do not change
+     * the tag data.
      */
-    private static void prepareReference() throws Exception {
+    private static synchronized List<List<double[]>> prepareReference(int numIterations)
+            throws Exception {
+        // The calm run must not have the extra decode work of an earlier scenario.
+        setExtraDecodePercent(0);
         List<List<double[]>> reference = new ArrayList<>();
         for (int i = 0; i < sceneFrames.length; i++) {
             reference.add(null);
@@ -1032,9 +1120,11 @@ public class MLTagEndToEndSimulation {
                 GStreamerCapture.open(cameraPipeline(sleepMicros, 0), GStreamerCaptureJNI.OUTPUT_GRAY);
         assertNotNull(capture, "Could not open the simulated camera");
         SimulatedCamera camera = new SimulatedCamera(capture, properties);
+        AprilTagPipelineSettings settings = makeSettings(1.0);
+        settings.numIterations = numIterations;
         AprilTagPipeline pipeline =
                 new SimulatedPipeline(
-                        makeSettings(1.0), 1, new SimulatedModel(new SimulatedNpu(1, 0, 0.0, 0), 1.0));
+                        settings, 1, new SimulatedModel(new SimulatedNpu(1, 0, 0.0, 0), 1.0));
         int missing = sceneFrames.length;
         long deadline =
                 System.nanoTime() + sceneFrames.length * sleepMicros * 1000L * 5 + 30_000_000_000L;
@@ -1057,15 +1147,25 @@ public class MLTagEndToEndSimulation {
                 assertTrue(index >= 0, "A frame has no valid index");
                 List<double[]> tags = tagData(result);
                 if (reference.get(index) == null) {
+                    // A NaN value can never be equal, so the load runs could not pass. Say it here,
+                    // where the cause is clear.
+                    for (double[] values : tags) {
+                        for (double value : values) {
+                            assertTrue(
+                                    !Double.isNaN(value), "The reference data of frame " + index + " has NaN");
+                        }
+                    }
                     reference.set(index, tags);
                     missing--;
                 } else {
                     // The same frame must always give the same data.
-                    List<List<double[]>> before = referenceTags;
-                    referenceTags = reference;
-                    String difference = compareWithReference(index, tags, true);
-                    referenceTags = before;
-                    assertTrue(difference == null, "The reference run is not stable: " + difference);
+                    String difference = compareWithReference(reference, index, tags);
+                    assertTrue(
+                            difference == null,
+                            "The reference run is not stable ("
+                                    + numIterations
+                                    + " pose iterations): "
+                                    + difference);
                 }
                 result.release();
             }
@@ -1075,7 +1175,8 @@ public class MLTagEndToEndSimulation {
         }
         assertEquals(0, missing, "The reference run did not get each frame");
         assertEquals(0, unknownFrames.get(), "The simulated model could not identify a frame");
-        referenceTags = reference;
+        referenceByIterations.put(numIterations, reference);
+        return reference;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1149,8 +1250,7 @@ public class MLTagEndToEndSimulation {
             return new CapturedFrame(
                     frame.toCVMat(),
                     properties,
-                    frame.toCaptureMetadata(
-                            FrameCaptureMetadata.SOURCE_GSTREAMER_JNI, MathUtils.wpiNanoTime()));
+                    frame.toCaptureMetadata(FrameCaptureMetadata.SOURCE_GSTREAMER_JNI));
         }
 
         @Override
@@ -1401,7 +1501,7 @@ public class MLTagEndToEndSimulation {
         settings.doMultiTarget = multiTag;
         settings.doSingleTargetAlways = multiTag;
         // The pose time is almost proportional to the number of iterations.
-        settings.numIterations = (int) Math.round(40 * workMultiplier);
+        settings.numIterations = iterationsFor(workMultiplier);
         settings.inputShouldShow = false;
         settings.outputShouldShow = false;
         settings.model =
@@ -1435,17 +1535,81 @@ public class MLTagEndToEndSimulation {
     // Vision loop
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * Checks the capture time, the order and the sequence ID of one result.
+     *
+     * @param resultCaptureNanos The capture time of the result.
+     * @param frameTimestampNanos The time stamp of the frame of the result.
+     * @param previousResultCaptureNanos The capture time of the previous result of the same camera,
+     *     or Long.MIN_VALUE for the first result.
+     * @param resultSequenceID The sequence ID of the result.
+     * @param frameSequenceID The sequence ID of the frame of the result.
+     * @return null if the result is correct, or a text that tells the error.
+     */
+    static String orderAndTimeError(
+            long resultCaptureNanos,
+            long frameTimestampNanos,
+            long previousResultCaptureNanos,
+            long resultSequenceID,
+            long frameSequenceID) {
+        // The robot code uses this time with the pose. A result for an older frame with the time of
+        // the newest frame gives a pose with a time that is too new.
+        if (resultCaptureNanos != frameTimestampNanos) {
+            return "capture time "
+                    + resultCaptureNanos
+                    + " is not the time of the result frame "
+                    + frameTimestampNanos;
+        }
+        // Strictly larger: a result out of capture order or a result given two times fails here.
+        if (resultCaptureNanos <= previousResultCaptureNanos) {
+            return "capture time "
+                    + resultCaptureNanos
+                    + " is not after the previous result "
+                    + previousResultCaptureNanos;
+        }
+        if (resultSequenceID != frameSequenceID) {
+            return "sequence ID "
+                    + resultSequenceID
+                    + " is not the ID of the result frame "
+                    + frameSequenceID;
+        }
+        return null;
+    }
+
+    /** Makes the pipeline of a camera loop. A test can give a pipeline with a fault. */
+    @FunctionalInterface
+    private interface PipelineMaker {
+        AprilTagPipeline make(AprilTagPipelineSettings settings, int lanes, Model model);
+    }
+
     /** The loop of VisionRunner for one camera, with measurement. */
     private static class CameraLoop implements Runnable {
         final SimulatedCamera camera;
         final AprilTagPipeline pipeline;
         final AtomicBoolean running = new AtomicBoolean(true);
         final AtomicBoolean measuring = new AtomicBoolean(false);
-        final boolean comparePose;
 
+        /** The reference data of the pose iteration count of this pipeline. */
+        final List<List<double[]>> reference;
+
+        /** Results in the measurement. The FPS values use it. */
         long results = 0;
-        long resultsEqualToReference = 0;
+
+        /** Results that were compared with the reference: each result from the first one. */
+        long checkedResults = 0;
+
+        /** Compared results that were equal to the reference. */
+        long checkedEqual = 0;
+
         String firstDifference;
+
+        /** Results with a wrong capture time, a wrong order or a wrong sequence ID. */
+        long orderAndTimeErrors = 0;
+
+        String firstOrderAndTimeError;
+        long previousResultCaptureNanos = Long.MIN_VALUE;
+        long previousNativeCaptureNanos = -1;
+        long previousNativeSequence = -1;
         long getNanos = 0;
         long runNanos = 0;
         long pipeNanos = 0;
@@ -1465,10 +1629,11 @@ public class MLTagEndToEndSimulation {
 
         Throwable failure;
 
-        CameraLoop(SimulatedCamera camera, AprilTagPipeline pipeline, boolean comparePose) {
+        CameraLoop(
+                SimulatedCamera camera, AprilTagPipeline pipeline, List<List<double[]>> reference) {
             this.camera = camera;
             this.pipeline = pipeline;
-            this.comparePose = comparePose;
+            this.reference = reference;
         }
 
         @Override
@@ -1491,11 +1656,14 @@ public class MLTagEndToEndSimulation {
 
                     if (pipeline == null) {
                         // Reference loop: take each frame and do no work. It shows the frame time
-                        // variation of the simulated camera and the JPEG decode alone.
+                        // variation of the simulated camera and the JPEG decode alone. There is no
+                        // tag data to compare, but the counts must not be 0, or the fraction of
+                        // equal results is 0 / 0.
                         long taken = System.nanoTime();
+                        checkedResults++;
+                        checkedEqual++;
                         if (measuring.get()) {
                             results++;
-                            resultsEqualToReference++;
                             resultSceneTypes.add(
                                     sceneFrames[Math.max(0, readFrameIndex(frame.colorImage.getMat()))].source());
                             resultPipeNanos.add(0L);
@@ -1519,20 +1687,62 @@ public class MLTagEndToEndSimulation {
                         continue;
                     }
                     long doneNanos = MathUtils.wpiNanoTime();
+                    // The tag data must be equal to the data of the calm run of this frame. This is
+                    // checked from the first result, not only in the measurement: the pipeline
+                    // changes its inference mode in the warm-up, and those results must be correct
+                    // too.
+                    int index = readFrameIndex(result.inputAndOutputFrame.colorImage.getMat());
+                    String difference =
+                            index < 0
+                                    ? "a result frame has no valid index"
+                                    : compareWithReference(reference, index, tagData(result));
+                    checkedResults++;
+                    if (difference == null) {
+                        checkedEqual++;
+                    } else if (firstDifference == null) {
+                        firstDifference = difference;
+                    }
+                    String orderError =
+                            orderAndTimeError(
+                                    result.getImageCaptureTimestampNanos(),
+                                    result.inputAndOutputFrame.timestampNanos,
+                                    previousResultCaptureNanos,
+                                    result.sequenceID,
+                                    result.inputAndOutputFrame.sequenceID);
+                    // The capture time of the native library (monotonic clock), computed in one
+                    // native call from the age of the frame. The error text gives it, so a reader
+                    // can see if the frames were out of order or only the Java time stamp moved.
+                    FrameCaptureMetadata metadata = result.inputAndOutputFrame.captureMetadata;
+                    long nativeCaptureNanos =
+                            metadata.estimatedAgeNanos() >= 0
+                                    ? metadata.nativePullTimestampNanos() - metadata.estimatedAgeNanos()
+                                    : -1;
+                    if (orderError != null) {
+                        orderAndTimeErrors++;
+                        if (firstOrderAndTimeError == null) {
+                            firstOrderAndTimeError =
+                                    orderError
+                                            + " (result "
+                                            + checkedResults
+                                            + ", frame index "
+                                            + index
+                                            + ", native capture time "
+                                            + nativeCaptureNanos
+                                            + " sequence "
+                                            + metadata.nativeSequence()
+                                            + ", previous result: native capture time "
+                                            + previousNativeCaptureNanos
+                                            + " sequence "
+                                            + previousNativeSequence
+                                            + ")";
+                        }
+                    }
+                    previousResultCaptureNanos = result.getImageCaptureTimestampNanos();
+                    previousNativeCaptureNanos = nativeCaptureNanos;
+                    previousNativeSequence = metadata.nativeSequence();
                     if (measuring.get()) {
                         pipeNanos += (long) result.processingNanos;
                         results++;
-                        // The tag data must be equal to the data of the calm run of this frame.
-                        int index = readFrameIndex(result.inputAndOutputFrame.colorImage.getMat());
-                        String difference =
-                                index < 0
-                                        ? "a result frame has no valid index"
-                                        : compareWithReference(index, tagData(result), comparePose);
-                        if (difference == null) {
-                            resultsEqualToReference++;
-                        } else if (firstDifference == null) {
-                            firstDifference = difference;
-                        }
                         resultSceneTypes.add(index < 0 ? 0 : sceneFrames[index].source());
                         resultPipeNanos.add((long) result.processingNanos);
                         latencyNanos.add(doneNanos - result.getImageCaptureTimestampNanos());
@@ -1563,7 +1773,54 @@ public class MLTagEndToEndSimulation {
             double pipeMillis,
             double[] p99Fps,
             double[] worstSecondFps,
-            double[] reportedFpsLow) {}
+            double[] reportedFpsLow,
+            long results,
+            long checkedResults,
+            long checkedEqual,
+            long orderAndTimeErrors,
+            String firstOrderAndTimeError,
+            int rtThreads,
+            int poseIterations) {}
+
+    /** The policy field of a line of /proc/.../stat (0 = SCHED_OTHER, 1 = SCHED_FIFO), or -1. */
+    static int schedulingPolicy(String stat) {
+        // The thread name (field 2) is in parentheses and can contain spaces, so the fields are
+        // counted after the last ')'. The first field there is field 3, so field 41 is index 38.
+        String[] fields = stat.substring(stat.lastIndexOf(')') + 1).trim().split(" +");
+        return fields.length > 38 ? Integer.parseInt(fields[38]) : -1;
+    }
+
+    /** The number of threads of this process with the policy SCHED_FIFO. */
+    private static int countRealtimeThreads() throws java.io.IOException {
+        int count = 0;
+        List<Path> tasks = new ArrayList<>();
+        try (var stream = java.nio.file.Files.list(Path.of("/proc/self/task"))) {
+            stream.forEach(tasks::add);
+        }
+        for (Path task : tasks) {
+            try {
+                if (schedulingPolicy(java.nio.file.Files.readString(task.resolve("stat"))) == 1) {
+                    count++;
+                }
+            } catch (java.io.IOException e) {
+                // The thread ended after the list was read.
+            }
+        }
+        return count;
+    }
+
+    /** PV_GSTREAMER_CAPTURE_RT_PRIORITY as the native library reads it: 0 to 50, 0 if not set. */
+    private static int realtimePrioritySetting() {
+        String raw = System.getenv("PV_GSTREAMER_CAPTURE_RT_PRIORITY");
+        if (raw == null || raw.isBlank()) {
+            return 0;
+        }
+        try {
+            return Math.max(0, Math.min(50, Integer.parseInt(raw.trim())));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
 
     /**
      * Runs one scenario.
@@ -1572,15 +1829,27 @@ public class MLTagEndToEndSimulation {
      * @param cameras Number of cameras.
      * @param slowdown The CPU of the coprocessor is this many times slower than this computer.
      * @param sleepMicros Camera pacing from {@link #calibrateCameraSleepMicros(double)}.
+     * @param extraDecodePercent The extra JPEG decode work, from {@link #extraDecodePercent(double)}.
+     * @param pipelineMaker Makes the pipeline of each camera.
      */
-    private static Outcome runScenario(Board board, int cameras, double slowdown, long sleepMicros)
+    private static Outcome runScenario(
+            Board board,
+            int cameras,
+            double slowdown,
+            long sleepMicros,
+            int extraDecodePercent,
+            PipelineMaker pipelineMaker)
             throws Exception {
         // Time scaling: all times of this computer are 1 / slowdown of the coprocessor times.
         // Work mode: real time, and the CPU stages do "slowdown" times their work. The JPEG decode
         // uses its own factor (PV_MLTAG_SIM_JPEG_FACTOR), and the gray mode has no JPEG decode.
         final double timeScale = WORK_MODE ? 1.0 : slowdown;
         final double workMultiplier = WORK_MODE ? slowdown : 1.0;
-        GStreamerCaptureJNI.setTestExtraDecodePercent(extraDecodePercent(slowdown));
+        final int poseIterations = iterationsFor(workMultiplier);
+        // The reference must have the pose iteration count of the load run, so that the pose can be
+        // compared. runBoard makes it before the scenario, with no extra decode work.
+        List<List<double[]>> reference = referenceByIterations.get(poseIterations);
+        assertNotNull(reference, "No reference for " + poseIterations + " pose iterations");
         // The CPU part of the inference is CPU work: it does not get shorter with the time scale,
         // and it is multiplied in the work mode.
         SimulatedNpu npu =
@@ -1590,235 +1859,329 @@ public class MLTagEndToEndSimulation {
                         board.inferenceSpread(),
                         Math.round(NPU_CPU_MILLIS * 1e6 * workMultiplier));
 
-        // PV_MLTAG_SIM_APP_CPUS=2,3 does what "taskset -c 2,3 java" does for the application: the
-        // threads that start from here get these CPUs. Use it with
-        // PV_GSTREAMER_CAPTURE_DECODE_CPUS, which gives each decode thread its own CPU.
-        String appCpus = System.getenv("PV_MLTAG_SIM_APP_CPUS");
-        if (appCpus != null && !appCpus.isBlank()) {
-            long mask = 0;
-            for (int cpu : intList("PV_MLTAG_SIM_APP_CPUS", new int[0])) {
-                mask |= 1L << cpu;
-            }
-            assertTrue(GStreamerCaptureJNI.setCurrentThreadCpuMask(mask), "Could not set the CPU mask");
-        }
-
         var properties = new FrameStaticProperties(WIDTH, HEIGHT, 80.0, makeCalibration());
         List<CameraLoop> loops = new ArrayList<>();
         List<Thread> threads = new ArrayList<>();
         List<GStreamerCapture> captures = new ArrayList<>();
-        for (int i = 0; i < cameras; i++) {
-            // Each camera starts at a different frame of the set, so the cameras do not have the
-            // same view at the same time.
-            int firstFrame = (int) ((long) i * sceneFrames.length / cameras);
-            GStreamerCapture capture =
-                    GStreamerCapture.open(
-                            cameraPipeline(sleepMicros, firstFrame), GStreamerCaptureJNI.OUTPUT_GRAY);
-            assertNotNull(capture, "Could not open the simulated camera");
-            captures.add(capture);
-            AprilTagPipeline pipeline =
-                    NULL_PIPELINE
-                            ? null
-                            : new SimulatedPipeline(
-                                    makeSettings(workMultiplier),
-                                    board.lanes(),
-                                    new SimulatedModel(npu, workMultiplier));
-            // The pose of the reference run has the standard number of iterations.
-            var loop =
-                    new CameraLoop(new SimulatedCamera(capture, properties), pipeline, workMultiplier == 1.0);
-            loops.add(loop);
-            Thread thread = new Thread(loop, "SimVision-" + i);
-            threads.add(thread);
-            thread.start();
-        }
-
-        var os =
-                (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
-
-        // Warm-up: JIT compile, detector creation, start of the inference overlap.
-        Thread.sleep(5000);
-        long[] sourceBefore = new long[cameras];
-        long[] producedBefore = new long[cameras];
-        long[] convertBefore = new long[cameras];
-        for (int i = 0; i < cameras; i++) {
-            var stats = captures.get(i).getStats();
-            sourceBefore[i] = stats.sourceBuffers();
-            producedBefore[i] = stats.framesProduced();
-            convertBefore[i] = stats.convertNanosSum();
-        }
-        long cpuBefore = os.getProcessCpuTime();
-        long gcCountBefore = 0;
-        long gcMillisBefore = 0;
-        for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
-            gcCountBefore += Math.max(0, gc.getCollectionCount());
-            gcMillisBefore += Math.max(0, gc.getCollectionTime());
-        }
-        long start = System.nanoTime();
-        for (CameraLoop loop : loops) {
-            loop.measuring.set(true);
-        }
-        Thread.sleep(measureMillis());
-        for (CameraLoop loop : loops) {
-            loop.measuring.set(false);
-        }
-        double seconds = (System.nanoTime() - start) / 1e9;
-        double cpuCores = (os.getProcessCpuTime() - cpuBefore) / 1e9 / seconds;
-        long gcCount = -gcCountBefore;
-        long gcMillis = -gcMillisBefore;
-        for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
-            gcCount += Math.max(0, gc.getCollectionCount());
-            gcMillis += Math.max(0, gc.getCollectionTime());
-        }
-
-        double cameraFps = 0;
-        double decodeMillis = 0;
-        for (int i = 0; i < cameras; i++) {
-            var stats = captures.get(i).getStats();
-            cameraFps += (stats.sourceBuffers() - sourceBefore[i]) / seconds / cameras;
-            long produced = stats.framesProduced() - producedBefore[i];
-            if (produced > 0) {
-                decodeMillis += (stats.convertNanosSum() - convertBefore[i]) / 1e6 / produced / cameras;
+        List<AprilTagPipeline> pipelines = new ArrayList<>();
+        lastScenarioCaptures = captures;
+        // The extra decode work is one setting for the whole process. It is set here, and the
+        // finally block below sets it back to 0, also when an assertion or an exception stops the
+        // scenario. Without this, later tests in the same JVM would decode each frame more times.
+        setExtraDecodePercent(extraDecodePercent);
+        Throwable primary = null;
+        try {
+            for (int i = 0; i < cameras; i++) {
+                // Each camera starts at a different frame of the set, so the cameras do not have
+                // the same view at the same time.
+                int firstFrame = (int) ((long) i * sceneFrames.length / cameras);
+                GStreamerCapture capture =
+                        GStreamerCapture.open(
+                                cameraPipeline(sleepMicros, firstFrame), GStreamerCaptureJNI.OUTPUT_GRAY);
+                assertNotNull(capture, "Could not open the simulated camera");
+                captures.add(capture);
+                AprilTagPipeline pipeline =
+                        NULL_PIPELINE
+                                ? null
+                                : pipelineMaker.make(
+                                        makeSettings(workMultiplier),
+                                        board.lanes(),
+                                        new SimulatedModel(npu, workMultiplier));
+                pipelines.add(pipeline);
+                var loop = new CameraLoop(new SimulatedCamera(capture, properties), pipeline, reference);
+                loops.add(loop);
+                Thread thread = new Thread(loop, "SimVision-" + i);
+                threads.add(thread);
+                thread.start();
             }
-        }
 
+            var os =
+                    (com.sun.management.OperatingSystemMXBean)
+                            ManagementFactory.getOperatingSystemMXBean();
+
+            // Warm-up: JIT compile, detector creation, start of the inference overlap. The tag data
+            // of the results in the warm-up is compared too (see CameraLoop), only the timing
+            // values are not measured.
+            Thread.sleep(5000);
+
+            // The capture threads must have the real-time policy that the run scripts give them.
+            // The native library only prints one line if the kernel refuses it, which is easy to
+            // miss, and then the frame times are not the times of the board.
+            int rtThreads = countRealtimeThreads();
+            // Each camera has a camera source thread, and in the mjpeg format a JPEG decode thread.
+            int expectedRtThreads = cameras * (GRAY_CAMERA ? 1 : 2);
+            if (realtimePrioritySetting() > 0 && rtThreads < expectedRtThreads) {
+                throw new AssertionError(
+                        "The kernel refused SCHED_FIFO (needs root or CAP_SYS_NICE): "
+                                + rtThreads
+                                + " real-time threads, expected "
+                                + expectedRtThreads
+                                + ". Remove PV_GSTREAMER_CAPTURE_RT_PRIORITY or give the permission.");
+            }
+
+            long[] sourceBefore = new long[cameras];
+            long[] producedBefore = new long[cameras];
+            long[] convertBefore = new long[cameras];
+            for (int i = 0; i < cameras; i++) {
+                var stats = captures.get(i).getStats();
+                sourceBefore[i] = stats.sourceBuffers();
+                producedBefore[i] = stats.framesProduced();
+                convertBefore[i] = stats.convertNanosSum();
+            }
+            long cpuBefore = os.getProcessCpuTime();
+            long gcCountBefore = 0;
+            long gcMillisBefore = 0;
+            for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+                gcCountBefore += Math.max(0, gc.getCollectionCount());
+                gcMillisBefore += Math.max(0, gc.getCollectionTime());
+            }
+            long start = System.nanoTime();
+            for (CameraLoop loop : loops) {
+                loop.measuring.set(true);
+            }
+            Thread.sleep(measureMillis());
+            for (CameraLoop loop : loops) {
+                loop.measuring.set(false);
+            }
+            double seconds = (System.nanoTime() - start) / 1e9;
+            double cpuCores = (os.getProcessCpuTime() - cpuBefore) / 1e9 / seconds;
+            long gcCount = -gcCountBefore;
+            long gcMillis = -gcMillisBefore;
+            for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+                gcCount += Math.max(0, gc.getCollectionCount());
+                gcMillis += Math.max(0, gc.getCollectionTime());
+            }
+
+            double cameraFps = 0;
+            double decodeMillis = 0;
+            for (int i = 0; i < cameras; i++) {
+                var stats = captures.get(i).getStats();
+                cameraFps += (stats.sourceBuffers() - sourceBefore[i]) / seconds / cameras;
+                long produced = stats.framesProduced() - producedBefore[i];
+                if (produced > 0) {
+                    decodeMillis += (stats.convertNanosSum() - convertBefore[i]) / 1e6 / produced / cameras;
+                }
+            }
+
+            // Stop the loops before their counters are read. The finally block releases the
+            // pipelines and the cameras.
+            for (CameraLoop loop : loops) {
+                loop.running.set(false);
+            }
+            for (Thread thread : threads) {
+                thread.join(5000);
+            }
+            for (int i = 0; i < cameras; i++) {
+                if (threads.get(i).isAlive()) {
+                    throw new AssertionError("The vision loop " + i + " did not stop");
+                }
+                if (loops.get(i).failure != null) {
+                    throw new AssertionError("The vision loop failed", loops.get(i).failure);
+                }
+            }
+
+            double[] resultFps = new double[cameras];
+            double[] p99Fps = new double[cameras];
+            double[] worstSecondFps = new double[cameras];
+            double[] reportedFpsLow = new double[cameras];
+            List<Long> allLatency = new ArrayList<>();
+            long results = 0;
+            long checkedResults = 0;
+            long checkedEqual = 0;
+            String firstDifference = null;
+            long orderAndTimeErrors = 0;
+            String firstOrderAndTimeError = null;
+            long getNanos = 0;
+            long runNanos = 0;
+            long pipeNanos = 0;
+            for (int i = 0; i < cameras; i++) {
+                CameraLoop loop = loops.get(i);
+                getNanos += loop.getNanos;
+                runNanos += loop.runNanos;
+                pipeNanos += loop.pipeNanos;
+                resultFps[i] = loop.results / seconds;
+                p99Fps[i] = percentileFps(loop.resultTimesNanos, 0.99, timeScale);
+                worstSecondFps[i] = worstWindowFps(loop.resultTimesNanos, timeScale);
+                // The FPS value of PhotonVision (CalculateFPSPipe, moving average of 20 frames): the
+                // value that 99% of the results are better than.
+                double[] reported =
+                        loop.reportedFps.stream().mapToDouble(Double::doubleValue).sorted().toArray();
+                reportedFpsLow[i] =
+                        reported.length > 0 ? reported[(int) (reported.length * 0.01)] / timeScale : 0;
+                allLatency.addAll(loop.latencyNanos);
+                results += loop.results;
+                checkedResults += loop.checkedResults;
+                checkedEqual += loop.checkedEqual;
+                if (firstDifference == null) {
+                    firstDifference = loop.firstDifference;
+                }
+                orderAndTimeErrors += loop.orderAndTimeErrors;
+                if (firstOrderAndTimeError == null) {
+                    firstOrderAndTimeError = loop.firstOrderAndTimeError;
+                }
+            }
+            if (System.getenv("PV_MLTAG_SIM_DETAIL") != null) {
+                // Times between results, in coprocessor milliseconds: how many are in each range.
+                int[] limits = {18, 20, 22, 25, 30, 40, 1000};
+                int[] counts = new int[limits.length];
+                int total = 0;
+                // Long times between results (25 ms or more), and how many of them have a pipeline
+                // call that waited 3 ms or more for the result (the result was not ready). The
+                // other long times come from a late camera frame.
+                int longIntervals = 0;
+                int longBecauseOfWait = 0;
+                for (CameraLoop loop : loops) {
+                    for (int i = 1; i < loop.resultTimesNanos.size(); i++) {
+                        double ms =
+                                (loop.resultTimesNanos.get(i) - loop.resultTimesNanos.get(i - 1))
+                                        / 1e6
+                                        * timeScale;
+                        if (ms >= 25) {
+                            longIntervals++;
+                            if (loop.resultRunNanos.get(i) / 1e6 * timeScale >= 3) {
+                                longBecauseOfWait++;
+                            }
+                        }
+                        for (int b = 0; b < limits.length; b++) {
+                            if (ms < limits[b]) {
+                                counts[b]++;
+                                break;
+                            }
+                        }
+                        total++;
+                    }
+                }
+                StringBuilder histogram = new StringBuilder();
+                for (int b = 0; b < limits.length; b++) {
+                    histogram.append(
+                            String.format(Locale.ROOT, "<%dms:%.2f%% ", limits[b], 100.0 * counts[b] / total));
+                }
+                line(
+                        "  intervals %s| long: %d, result not ready: %d | gc: %d collections, %d ms",
+                        histogram, longIntervals, longBecauseOfWait, gcCount, gcMillis);
+                // For each source: the time of the pipeline and the long times between results.
+                for (int type = 0; type < sourceNames.size(); type++) {
+                    long count = 0;
+                    long pipe = 0;
+                    long longTimes = 0;
+                    for (CameraLoop loop : loops) {
+                        for (int i = 1; i < loop.resultTimesNanos.size(); i++) {
+                            if (loop.resultSceneTypes.get(i) != type) {
+                                continue;
+                            }
+                            count++;
+                            pipe += loop.resultPipeNanos.get(i);
+                            double ms =
+                                    (loop.resultTimesNanos.get(i) - loop.resultTimesNanos.get(i - 1))
+                                            / 1e6
+                                            * timeScale;
+                            if (ms >= 25) {
+                                longTimes++;
+                            }
+                        }
+                    }
+                    if (count > 0) {
+                        line(
+                                "    source %2d %-44s results=%d pipesMs=%.1f longTimes=%.2f%%",
+                                type,
+                                sourceNames.get(type),
+                                count,
+                                pipe / 1e6 / count * timeScale,
+                                100.0 * longTimes / count);
+                    }
+                }
+            }
+
+            long[] sorted = allLatency.stream().mapToLong(Long::longValue).sorted().toArray();
+            assertTrue(sorted.length > 0, "The simulation gave no result");
+
+            // Convert from the time of this computer to the time of the coprocessor.
+            for (int i = 0; i < cameras; i++) {
+                resultFps[i] /= timeScale;
+            }
+            return new Outcome(
+                    cameraFps / timeScale,
+                    resultFps,
+                    sorted[sorted.length / 2] / 1e6 * timeScale,
+                    sorted[(int) (sorted.length * 0.95)] / 1e6 * timeScale,
+                    sorted[sorted.length - 1] / 1e6 * timeScale,
+                    (double) checkedEqual / checkedResults,
+                    firstDifference,
+                    decodeMillis * timeScale,
+                    cpuCores,
+                    getNanos / 1e6 / results * timeScale,
+                    runNanos / 1e6 / results * timeScale,
+                    pipeNanos / 1e6 / results * timeScale,
+                    p99Fps,
+                    worstSecondFps,
+                    reportedFpsLow,
+                    results,
+                    checkedResults,
+                    checkedEqual,
+                    orderAndTimeErrors,
+                    firstOrderAndTimeError,
+                    rtThreads,
+                    poseIterations);
+        } catch (Throwable t) {
+            primary = t;
+            throw t;
+        } finally {
+            restoreAfterScenario(loops, threads, captures, pipelines, primary);
+        }
+    }
+
+    /**
+     * Puts the test state back after a scenario: no extra decode work, the loops stopped, and the
+     * pipelines and captures released. A pipeline or a capture of a loop that did not stop is not
+     * released, because its thread can still use it. That is an error.
+     *
+     * @param primary The exception that stops the scenario, or null. An error of the cleanup is
+     *     added to it, so that the first cause stays visible.
+     */
+    private static void restoreAfterScenario(
+            List<CameraLoop> loops,
+            List<Thread> threads,
+            List<GStreamerCapture> captures,
+            List<AprilTagPipeline> pipelines,
+            Throwable primary)
+            throws InterruptedException {
+        setExtraDecodePercent(0);
         for (CameraLoop loop : loops) {
             loop.running.set(false);
         }
         for (Thread thread : threads) {
             thread.join(5000);
         }
-
-        double[] resultFps = new double[cameras];
-        double[] p99Fps = new double[cameras];
-        double[] worstSecondFps = new double[cameras];
-        double[] reportedFpsLow = new double[cameras];
-        List<Long> allLatency = new ArrayList<>();
-        long results = 0;
-        long complete = 0;
-        String firstDifference = null;
-        long getNanos = 0;
-        long runNanos = 0;
-        long pipeNanos = 0;
-        for (int i = 0; i < cameras; i++) {
-            CameraLoop loop = loops.get(i);
-            getNanos += loop.getNanos;
-            runNanos += loop.runNanos;
-            pipeNanos += loop.pipeNanos;
-            if (loop.failure != null) {
-                throw new AssertionError("The vision loop failed", loop.failure);
-            }
-            resultFps[i] = loop.results / seconds;
-            p99Fps[i] = percentileFps(loop.resultTimesNanos, 0.99, timeScale);
-            worstSecondFps[i] = worstWindowFps(loop.resultTimesNanos, timeScale);
-            // The FPS value of PhotonVision (CalculateFPSPipe, moving average of 20 frames): the
-            // value that 99% of the results are better than.
-            double[] reported =
-                    loop.reportedFps.stream().mapToDouble(Double::doubleValue).sorted().toArray();
-            reportedFpsLow[i] =
-                    reported.length > 0 ? reported[(int) (reported.length * 0.01)] / timeScale : 0;
-            allLatency.addAll(loop.latencyNanos);
-            results += loop.results;
-            complete += loop.resultsEqualToReference;
-            if (firstDifference == null) {
-                firstDifference = loop.firstDifference;
-            }
-            if (loop.pipeline != null) {
-                loop.pipeline.release();
-            }
-            loop.camera.release();
-        }
-        if (System.getenv("PV_MLTAG_SIM_DETAIL") != null) {
-            // Times between results, in coprocessor milliseconds: how many are in each range.
-            int[] limits = {18, 20, 22, 25, 30, 40, 1000};
-            int[] counts = new int[limits.length];
-            int total = 0;
-            // Long times between results (25 ms or more), and how many of them have a pipeline call
-            // that waited 3 ms or more for the result (the result was not ready). The other long
-            // times come from a late camera frame.
-            int longIntervals = 0;
-            int longBecauseOfWait = 0;
-            for (CameraLoop loop : loops) {
-                for (int i = 1; i < loop.resultTimesNanos.size(); i++) {
-                    double ms =
-                            (loop.resultTimesNanos.get(i) - loop.resultTimesNanos.get(i - 1)) / 1e6 * timeScale;
-                    if (ms >= 25) {
-                        longIntervals++;
-                        if (loop.resultRunNanos.get(i) / 1e6 * timeScale >= 3) {
-                            longBecauseOfWait++;
-                        }
-                    }
-                    for (int b = 0; b < limits.length; b++) {
-                        if (ms < limits[b]) {
-                            counts[b]++;
-                            break;
-                        }
-                    }
-                    total++;
+        AssertionError notStopped = null;
+        for (int i = 0; i < captures.size(); i++) {
+            if (i < threads.size() && threads.get(i).isAlive()) {
+                if (notStopped == null) {
+                    notStopped =
+                            new AssertionError(
+                                    "The vision loop "
+                                            + i
+                                            + " did not stop. Its pipeline and capture are not released.");
                 }
+                continue;
             }
-            StringBuilder histogram = new StringBuilder();
-            for (int b = 0; b < limits.length; b++) {
-                histogram.append(
-                        String.format(Locale.ROOT, "<%dms:%.2f%% ", limits[b], 100.0 * counts[b] / total));
+            AprilTagPipeline pipeline = i < pipelines.size() ? pipelines.get(i) : null;
+            if (pipeline != null) {
+                pipeline.release();
             }
-            line(
-                    "  intervals %s| long: %d, result not ready: %d | gc: %d collections, %d ms",
-                    histogram, longIntervals, longBecauseOfWait, gcCount, gcMillis);
-            // For each source: the time of the pipeline and the long times between results.
-            for (int type = 0; type < sourceNames.size(); type++) {
-                long count = 0;
-                long pipe = 0;
-                long longTimes = 0;
-                for (CameraLoop loop : loops) {
-                    for (int i = 1; i < loop.resultTimesNanos.size(); i++) {
-                        if (loop.resultSceneTypes.get(i) != type) {
-                            continue;
-                        }
-                        count++;
-                        pipe += loop.resultPipeNanos.get(i);
-                        double ms =
-                                (loop.resultTimesNanos.get(i) - loop.resultTimesNanos.get(i - 1)) / 1e6 * timeScale;
-                        if (ms >= 25) {
-                            longTimes++;
-                        }
-                    }
-                }
-                if (count > 0) {
-                    line(
-                            "    source %2d %-44s results=%d pipesMs=%.1f longTimes=%.2f%%",
-                            type,
-                            sourceNames.get(type),
-                            count,
-                            pipe / 1e6 / count * timeScale,
-                            100.0 * longTimes / count);
-                }
+            if (i < loops.size()) {
+                // The simulated camera closes its capture.
+                loops.get(i).camera.release();
+            } else {
+                captures.get(i).close();
             }
         }
-
-        long[] sorted = allLatency.stream().mapToLong(Long::longValue).sorted().toArray();
-        assertTrue(sorted.length > 0, "The simulation gave no result");
-
-        GStreamerCaptureJNI.setTestExtraDecodePercent(0);
-
-        // Convert from the time of this computer to the time of the coprocessor.
-        for (int i = 0; i < cameras; i++) {
-            resultFps[i] /= timeScale;
+        if (notStopped != null) {
+            if (primary != null) {
+                primary.addSuppressed(notStopped);
+            } else {
+                throw notStopped;
+            }
         }
-        return new Outcome(
-                cameraFps / timeScale,
-                resultFps,
-                sorted[sorted.length / 2] / 1e6 * timeScale,
-                sorted[(int) (sorted.length * 0.95)] / 1e6 * timeScale,
-                sorted[sorted.length - 1] / 1e6 * timeScale,
-                (double) complete / results,
-                firstDifference,
-                decodeMillis * timeScale,
-                cpuCores,
-                getNanos / 1e6 / results * timeScale,
-                runNanos / 1e6 / results * timeScale,
-                pipeNanos / 1e6 / results * timeScale,
-                p99Fps,
-                worstSecondFps,
-                reportedFpsLow);
     }
 
     /**
@@ -1864,6 +2227,19 @@ public class MLTagEndToEndSimulation {
         return worst == Double.MAX_VALUE ? 0 : worst;
     }
 
+    /**
+     * The number of parallel groups that VisionWorkerPool.maxGroups gives a pipeline of this
+     * simulation (settings.threads = 4) with the default PV_MLTAG_ROI_POOL_ADAPTIVE=true. It is the
+     * formula of VisionWorkerPool.maxGroups. The report does not call maxGroups, because a call
+     * registers the calling thread as one more camera for one second, which changes the group count
+     * of the pipelines.
+     */
+    static int expectedGroups(int poolThreads, int cpus, int cameras) {
+        int limit = Math.min(VisionWorkerPool.MAX_GROUPS, poolThreads + 1);
+        limit = Math.min(limit, Math.max(1, (cpus - cameras) / cameras));
+        return Math.max(1, Math.min(4, limit));
+    }
+
     private static void report(Board board, int cameras, double slowdown, Outcome o) {
         StringBuilder fps = new StringBuilder();
         for (double value : o.resultFps()) {
@@ -1889,10 +2265,13 @@ public class MLTagEndToEndSimulation {
                                         .stripTrailingZeros()
                                         .toPlainString()
                         : "";
+        String notValid = cpuCountNotValid ? " | NOT VALID FOR THE BOARD: " + hostCpus + " CPUs" : "";
         line(
                 "%-11s cameras=%d cpuSlowdown=%.1f%s npuMs=%.1f | cameraFps=%.1f resultFps=%s"
                         + "p99FrameFps=%sp99ReportedFps=%sworstSecondFps=%s| latencyMs p50=%.1f p95=%.1f max=%.1f | decodeMs=%.1f getMs=%.1f runMs=%.1f"
-                        + " pipesMs=%.1f | equalToReference=%.2f%% | cpuCoresBusy=%.2f | modelInput=%s",
+                        + " pipesMs=%.1f | equalToReference=%.2f%% (%d results from the first one)"
+                        + " orderAndTimeErrors=%d | poseIterations=%d, pose compared | groups=%d"
+                        + " rtThreads=%d | cpuCoresBusy=%.2f | modelInput=%s%s",
                 board.name(),
                 cameras,
                 slowdown,
@@ -1911,8 +2290,14 @@ public class MLTagEndToEndSimulation {
                 o.runMillis(),
                 o.pipeMillis(),
                 o.equalToReferenceFraction() * 100.0,
+                o.checkedResults(),
+                o.orderAndTimeErrors(),
+                o.poseIterations(),
+                expectedGroups(VisionWorkerPool.THREADS, appCpus, cameras),
+                o.rtThreads(),
                 o.cpuCores(),
-                modelInputPath);
+                modelInputPath,
+                notValid);
     }
 
     private static double[] slowdowns() {
@@ -1936,7 +2321,67 @@ public class MLTagEndToEndSimulation {
         return Arrays.stream(raw.split(",")).mapToInt(Integer::parseInt).toArray();
     }
 
-    private static void runBoard(Board defaultBoard) throws Exception {
+    /**
+     * Checks the CPU count of the JVM against the board, and applies PV_MLTAG_SIM_APP_CPUS. Call it
+     * before prepareScene: then the reference run, the pool threads of VisionWorkerPool and all
+     * calibrations run under the CPU mask, as with "taskset java".
+     */
+    private static synchronized void prepareCpus(Board board) {
+        // One time only: the mask stays on the JUnit thread, so a second test in the same JVM would
+        // read the masked count.
+        if (hostCpus < 0) {
+            // On Linux this is the CPU count of the mask of the calling thread.
+            hostCpus = Runtime.getRuntime().availableProcessors();
+            appCpus = hostCpus;
+            // PV_MLTAG_SIM_APP_CPUS=2,3 does what "taskset -c 2,3 java" does for the application:
+            // the threads that start from here get these CPUs. Use it with
+            // PV_GSTREAMER_CAPTURE_DECODE_CPUS, which gives each decode thread its own CPU. The GC
+            // and JIT threads of the JVM keep all CPUs.
+            String appCpuSetting = System.getenv("PV_MLTAG_SIM_APP_CPUS");
+            if (appCpuSetting != null && !appCpuSetting.isBlank()) {
+                long mask = 0;
+                for (int cpu : intList("PV_MLTAG_SIM_APP_CPUS", new int[0])) {
+                    assertTrue(cpu >= 0 && cpu <= 63, "PV_MLTAG_SIM_APP_CPUS: CPU " + cpu + " is not 0 to 63");
+                    mask |= 1L << cpu;
+                }
+                assertTrue(GStreamerCaptureJNI.setCurrentThreadCpuMask(mask), "Could not set the CPU mask");
+                appCpus = Long.bitCount(mask);
+            }
+        }
+        if (hostCpus != board.cpus()) {
+            if ("1".equals(System.getenv("PV_MLTAG_SIM_ALLOW_CPU_COUNT"))) {
+                cpuCountNotValid = true;
+                line(
+                        "The JVM can use %d CPUs, the board has %d. The results are NOT VALID for the"
+                                + " board.",
+                        hostCpus,
+                        board.cpus());
+            } else {
+                throw new AssertionError(
+                        "The simulation models a board with "
+                                + board.cpus()
+                                + " CPUs, but this JVM can use "
+                                + hostCpus
+                                + ". The number of parallel groups of VisionWorkerPool and the competition"
+                                + " for the CPUs are then different from the board. Run: ./gradlew --stop;"
+                                + " then taskset -c <"
+                                + board.cpus()
+                                + " CPUs on "
+                                + board.cpus()
+                                + " different physical cores, see lscpu -e> ./gradlew --no-daemon"
+                                + " :photon-core:test --tests ... A Gradle daemon that already runs keeps its"
+                                + " own CPU mask. Set PV_MLTAG_SIM_ALLOW_CPU_COUNT=1 to run anyway.");
+            }
+        }
+    }
+
+    private static String setting(String name) {
+        String value = System.getenv(name);
+        return value == null || value.isBlank() ? "(not set)" : value;
+    }
+
+    /** The checks and the preparation that each simulation test needs before its scenarios. */
+    private static void prepareSimulation(Board board) throws Exception {
         assumeTrue(enabled(), "Set PV_MLTAG_SIM=1 to run the simulation");
         assumeTrue(GStreamerCapture.isAvailable(), "Native GStreamer capture library is not loaded");
         assertTrue(
@@ -1946,15 +2391,37 @@ public class MLTagEndToEndSimulation {
         if (!GRAY_CAMERA) {
             assumeTrue(GStreamerCaptureJNI.hasCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE));
         }
+        prepareCpus(board);
         prepareScene();
+    }
+
+    private static void runBoard(Board defaultBoard) throws Exception {
+        prepareSimulation(defaultBoard);
         line(
                 "mode: %s. Camera format: %s. ATR (adaptive tag resizing): %s. CPU time of the NPU"
-                        + " library: %.1f ms for each inference. Computer: %d CPUs.",
+                        + " library: %.1f ms for each inference.",
                 WORK_MODE ? "real time with more CPU work" : "time scaling",
                 GRAY_CAMERA ? "gray (uncompressed GRAY8, no JPEG decode)" : "mjpeg",
                 ATR_ENABLED ? "on (pipeline default)" : "off",
-                NPU_CPU_MILLIS,
-                Runtime.getRuntime().availableProcessors());
+                NPU_CPU_MILLIS);
+        // The settings that change the result. A run with other settings than the run scripts is
+        // then visible in the output.
+        line(
+                "settings: hostCpus=%d appCpus=%d boardCpus=%d VisionWorkerPool.THREADS=%d"
+                        + " PV_OPENCV_THREADS=%s (OpenCV threads %d) PV_GSTREAMER_CAPTURE_RT_PRIORITY=%s"
+                        + " PV_GSTREAMER_CAPTURE_JPEG_IDCT=%s PV_GSTREAMER_CAPTURE_DECODE_CPUS=%s"
+                        + " PV_MLTAG_SIM_APP_CPUS=%s cameraFormat=%s",
+                hostCpus,
+                appCpus,
+                defaultBoard.cpus(),
+                VisionWorkerPool.THREADS,
+                setting("PV_OPENCV_THREADS"),
+                Core.getNumThreads(),
+                setting("PV_GSTREAMER_CAPTURE_RT_PRIORITY"),
+                setting("PV_GSTREAMER_CAPTURE_JPEG_IDCT"),
+                setting("PV_GSTREAMER_CAPTURE_DECODE_CPUS"),
+                setting("PV_MLTAG_SIM_APP_CPUS"),
+                CAMERA_FORMAT);
 
         // PV_MLTAG_SIM_INFERENCE_MS is a list of mean inference times that replace the time of the
         // board (to find the limit of the NPU).
@@ -1967,6 +2434,10 @@ public class MLTagEndToEndSimulation {
                                 .toArray();
 
         for (double slowdown : slowdowns()) {
+            // The load run of the work mode uses more pose iterations. A calm run with the same
+            // count gives its reference, so the pose is compared too. It runs before the camera
+            // calibration and with no extra decode work.
+            ensureReference(iterationsFor(WORK_MODE ? slowdown : 1.0));
             long sleepMicros = calibrateCameraSleepMicros(WORK_MODE ? CAMERA_FPS : CAMERA_FPS * slowdown);
             for (double inferenceMillis : inferenceTimes) {
                 Board board =
@@ -1975,18 +2446,37 @@ public class MLTagEndToEndSimulation {
                                 defaultBoard.npuCores(),
                                 inferenceMillis,
                                 defaultBoard.inferenceSpread(),
-                                defaultBoard.lanes());
+                                defaultBoard.lanes(),
+                                defaultBoard.cpus());
                 for (int cameras : intList("PV_MLTAG_SIM_CAMERAS", new int[] {1, 2})) {
-                    Outcome outcome = runScenario(board, cameras, slowdown, sleepMicros);
+                    Outcome outcome =
+                            runScenario(
+                                    board,
+                                    cameras,
+                                    slowdown,
+                                    sleepMicros,
+                                    extraDecodePercent(slowdown),
+                                    SimulatedPipeline::new);
                     report(board, cameras, slowdown, outcome);
                     // The tag data of each result must be equal to the data of the calm run of the
-                    // same frame, also at full load.
+                    // same frame, also at full load and in the warm-up.
                     assertEquals(0, unknownFrames.get(), "The simulated model could not identify a frame");
                     assertEquals(
-                            1.0,
-                            outcome.equalToReferenceFraction(),
-                            1e-12,
+                            outcome.checkedResults(),
+                            outcome.checkedEqual(),
                             "A result is not equal to the reference: " + outcome.firstDifference());
+                    // The comparison must include the results of the warm-up, so it must have more
+                    // results than the measurement.
+                    if (!NULL_PIPELINE) {
+                        assertTrue(
+                                outcome.checkedResults() > outcome.results(),
+                                "The warm-up results were not compared");
+                    }
+                    assertEquals(
+                            0,
+                            outcome.orderAndTimeErrors(),
+                            "A result has a wrong capture time, order or sequence ID: "
+                                    + outcome.firstOrderAndTimeError());
                 }
             }
         }
@@ -2000,5 +2490,182 @@ public class MLTagEndToEndSimulation {
     @Test
     public void orangePi5() throws Exception {
         runBoard(ORANGE_PI);
+    }
+
+    /** One frame with one tag: ID, 4 corners, pose (15 values). */
+    private static List<List<double[]>> oneTagReference() {
+        double[] values = new double[15];
+        for (int i = 0; i < values.length; i++) {
+            values[i] = 1.0 + i * 0.25;
+        }
+        List<List<double[]>> reference = new ArrayList<>();
+        reference.add(List.of(values));
+        return reference;
+    }
+
+    private static List<double[]> changed(List<List<double[]>> reference, int value, double newValue) {
+        double[] copy = reference.get(0).get(0).clone();
+        copy[value] = newValue;
+        return List.of(copy);
+    }
+
+    @Test
+    public void compareWithReferenceComparesThePose() {
+        List<List<double[]>> reference = oneTagReference();
+        double pose = reference.get(0).get(0)[12];
+        double corner = reference.get(0).get(0)[3];
+        assertNull(compareWithReference(reference, 0, changed(reference, 12, pose)));
+        // A change of a pose value must be found in each mode: there is no path that skips it.
+        String poseDifference = compareWithReference(reference, 0, changed(reference, 12, pose + 1e-6));
+        assertNotNull(poseDifference);
+        assertTrue(poseDifference.contains("value 12"), poseDifference);
+        assertNotNull(compareWithReference(reference, 0, changed(reference, 3, corner + 1e-6)));
+    }
+
+    @Test
+    public void compareWithReferenceDoesNotAcceptNaN() {
+        List<List<double[]>> reference = oneTagReference();
+        // A NaN corner or pose in the result.
+        assertNotNull(compareWithReference(reference, 0, changed(reference, 5, Double.NaN)));
+        assertNotNull(compareWithReference(reference, 0, changed(reference, 12, Double.NaN)));
+        // NaN in the reference and a number in the result.
+        List<List<double[]>> nanReference = new ArrayList<>();
+        nanReference.add(changed(reference, 12, Double.NaN));
+        assertNotNull(compareWithReference(nanReference, 0, reference.get(0)));
+        // NaN in both: a NaN pose is never a valid equal result.
+        assertNotNull(compareWithReference(nanReference, 0, changed(reference, 12, Double.NaN)));
+    }
+
+    @Test
+    public void orderAndTimeErrorFindsWrongTimeOrderAndDuplicate() {
+        // A correct sequence: each result has the time and the ID of its own frame, in order.
+        assertNull(orderAndTimeError(100, 100, Long.MIN_VALUE, 1, 1));
+        assertNull(orderAndTimeError(117, 117, 100, 2, 2));
+        // The time of the newest input frame on the result of an older frame.
+        assertNotNull(orderAndTimeError(134, 117, 100, 2, 2));
+        // Two results in the wrong order.
+        assertNotNull(orderAndTimeError(100, 100, 117, 1, 1));
+        // The same result two times.
+        assertNotNull(orderAndTimeError(117, 117, 117, 2, 2));
+        // The sequence ID of a different frame.
+        assertNotNull(orderAndTimeError(117, 117, 100, 3, 2));
+    }
+
+    @Test
+    public void schedulingPolicyAndGroupsAreRead() {
+        // A line of /proc/<pid>/task/<tid>/stat with a thread name that has a space and a ')'.
+        // Field 40 (rt_priority) is 10 and field 41 (policy) is 1 = SCHED_FIFO.
+        StringBuilder stat = new StringBuilder("1234 (pv jpeg) decode) S");
+        for (int field = 4; field <= 52; field++) {
+            stat.append(' ').append(field == 40 ? 10 : field == 41 ? 1 : 0);
+        }
+        assertEquals(1, schedulingPolicy(stat.toString()));
+        assertEquals(0, schedulingPolicy(stat.toString().replace(" 10 1 ", " 0 0 ")));
+        // The formula of VisionWorkerPool.maxGroups for 4 CPUs (3 pool threads), as on the board.
+        assertEquals(3, expectedGroups(3, 4, 1));
+        assertEquals(1, expectedGroups(3, 4, 2));
+        // 8 CPUs give more groups: this is why the CPU count of the JVM must be the board count.
+        assertEquals(3, expectedGroups(7, 8, 2));
+        assertEquals(4, expectedGroups(7, 8, 1));
+    }
+
+    /**
+     * A pipeline with the fault of the base code: the result gets the time of the input frame of the
+     * call, not the time of the frame that the result is for.
+     */
+    private static class InputFrameTimePipeline extends SimulatedPipeline {
+        InputFrameTimePipeline(AprilTagPipelineSettings settings, int lanes, Model model) {
+            super(settings, lanes, model);
+        }
+
+        @Override
+        public CVPipelineResult run(Frame frame, QuirkyCamera cameraQuirks) {
+            CVPipelineResult result = super.run(frame, cameraQuirks);
+            if (result != null) {
+                result.setImageCaptureTimestampNanos(frame.timestampNanos);
+            }
+            return result;
+        }
+    }
+
+    /**
+     * Proof that the capture time check works: with the input frame time on each result, the
+     * results of the overlap mode (a result for an older frame) must give errors. Needs
+     * PV_MLTAG_SIM=1.
+     */
+    @Test
+    public void inputFrameTimeOnTheResultIsFound() throws Exception {
+        prepareSimulation(ORANGE_PI);
+        assumeTrue(!NULL_PIPELINE, "The null pipeline gives no results");
+        ensureReference(iterationsFor(1.0));
+        long sleepMicros = calibrateCameraSleepMicros(CAMERA_FPS);
+        // k = 1 in both modes: the inference time of the Orange Pi is longer than the camera period,
+        // so the pipeline uses the overlap mode.
+        Outcome outcome = runScenario(ORANGE_PI, 1, 1.0, sleepMicros, 0, InputFrameTimePipeline::new);
+        line(
+                "input frame time proof: orderAndTimeErrors=%d of %d results, first: %s",
+                outcome.orderAndTimeErrors(),
+                outcome.checkedResults(),
+                outcome.firstOrderAndTimeError());
+        assertTrue(outcome.orderAndTimeErrors() > 0, "The wrong capture time was not found");
+        assertTrue(
+                outcome.firstOrderAndTimeError().contains("is not the time of the result frame"),
+                outcome.firstOrderAndTimeError());
+        // The tag data is still correct: only the time is wrong.
+        assertEquals(outcome.checkedResults(), outcome.checkedEqual(), outcome.firstDifference());
+    }
+
+    /** A pipeline that fails after some calls. It records that it was released. */
+    private static class FailingPipeline extends SimulatedPipeline {
+        static final List<FailingPipeline> made = new java.util.concurrent.CopyOnWriteArrayList<>();
+        int calls = 0;
+        volatile boolean released = false;
+
+        FailingPipeline(AprilTagPipelineSettings settings, int lanes, Model model) {
+            super(settings, lanes, model);
+            made.add(this);
+        }
+
+        @Override
+        public CVPipelineResult run(Frame frame, QuirkyCamera cameraQuirks) {
+            if (++calls > 100) {
+                frame.release();
+                throw new IllegalStateException("Simulated pipeline fault");
+            }
+            return super.run(frame, cameraQuirks);
+        }
+
+        @Override
+        public void release() {
+            released = true;
+            super.release();
+        }
+    }
+
+    /**
+     * A scenario that a fault stops must put the test state back: no extra decode work for later
+     * tests in the same JVM, and each pipeline and capture released. Needs PV_MLTAG_SIM=1.
+     */
+    @Test
+    public void failedScenarioRestoresTheTestState() throws Exception {
+        prepareSimulation(ORANGE_PI);
+        assumeTrue(!NULL_PIPELINE, "The null pipeline has no pipeline that can fail");
+        ensureReference(iterationsFor(1.0));
+        long sleepMicros = calibrateCameraSleepMicros(CAMERA_FPS);
+        FailingPipeline.made.clear();
+        AssertionError error =
+                assertThrows(
+                        AssertionError.class,
+                        () -> runScenario(ORANGE_PI, 2, 1.0, sleepMicros, 100, FailingPipeline::new));
+        assertTrue(error.getMessage().contains("The vision loop failed"), error.getMessage());
+        assertEquals(0, activeExtraDecodePercent, "The extra decode work is still on");
+        assertEquals(2, FailingPipeline.made.size());
+        for (FailingPipeline pipeline : FailingPipeline.made) {
+            assertTrue(pipeline.released, "A pipeline was not released");
+        }
+        assertEquals(2, lastScenarioCaptures.size());
+        for (GStreamerCapture capture : lastScenarioCaptures) {
+            assertTrue(!capture.isOpen(), "A capture was not closed");
+        }
     }
 }

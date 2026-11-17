@@ -25,7 +25,6 @@ import org.photonvision.common.hardware.Platform;
 import org.photonvision.common.logging.LogGroup;
 import org.photonvision.common.logging.Logger;
 import org.photonvision.common.util.EnvUtils;
-import org.photonvision.common.util.math.MathUtils;
 import org.photonvision.gstreamer.GStreamerCapture;
 import org.photonvision.gstreamer.GStreamerCaptureJNI;
 import org.photonvision.gstreamer.GStreamerFrame;
@@ -118,8 +117,10 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
         }
         lastFrameNanos = System.nanoTime();
 
+        // The capture time comes from the native clock values of the frame. A JVM pause after
+        // grab() returned does not make it too new.
         FrameCaptureMetadata metadata =
-                frame.toCaptureMetadata(FrameCaptureMetadata.SOURCE_GSTREAMER_JNI, MathUtils.wpiNanoTime());
+                frame.toCaptureMetadata(FrameCaptureMetadata.SOURCE_GSTREAMER_JNI);
         CVMat image = frame.toCVMat();
         if (frame.channels() == 1 && !monochromeAllowed) {
             image = expandToBgr(image);
