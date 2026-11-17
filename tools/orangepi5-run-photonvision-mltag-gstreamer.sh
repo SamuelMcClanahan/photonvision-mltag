@@ -92,6 +92,14 @@ export PV_USB_GSTREAMER_HW_JPEG_DECODER="${PV_USB_GSTREAMER_HW_JPEG_DECODER:-}"
 # all three cores are busy (27 ms for 55 FPS, 30 ms for 50 FPS). The RKNN
 # benchmark in docs/source/docs/benchmarks measured 23.0 ms for YOLOv11 on one
 # core. PhotonVision writes a log line when the number of frames in work changes.
+#
+# Which value to use (results of the end-to-end simulation, not of hardware):
+#   Two cameras: use 2. With 3 the FPS is the same, and the latency is about
+#   one camera frame period more when the NPU is the limit.
+#   One camera: 2 is sufficient if one inference takes about 23 ms. With a slow
+#   CPU and a slow NPU, 2 gave 58 FPS at 29 ms and 53 to 55 FPS at 32 ms. With 3
+#   the result was 59 to 60 FPS up to 32 ms, with about one frame period more
+#   latency.
 export PV_MLTAG_INFERENCE_LANES="${PV_MLTAG_INFERENCE_LANES:-2}"
 
 # Time reserve of the overlap, as a part of one camera frame period. With 0.3
