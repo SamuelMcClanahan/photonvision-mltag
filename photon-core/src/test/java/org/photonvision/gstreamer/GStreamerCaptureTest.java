@@ -384,6 +384,399 @@ public class GStreamerCaptureTest {
         }
     }
 
+    /** Returns the index of the last FF D9 (EOI) marker. */
+    private static int lastEoiIndex(byte[] jpeg) {
+        for (int i = jpeg.length - 2; i >= 0; i--) {
+            if ((jpeg[i] & 0xff) == 0xff && (jpeg[i + 1] & 0xff) == 0xd9) {
+                return i;
+            }
+        }
+        throw new AssertionError("The JPEG has no EOI marker");
+    }
+
+    /** Inserts zero bytes before the EOI marker, as a camera that pads its frames does. */
+    private static byte[] padBeforeEoi(byte[] jpeg, int count) {
+        int eoi = lastEoiIndex(jpeg);
+        byte[] result = new byte[jpeg.length + count];
+        System.arraycopy(jpeg, 0, result, 0, eoi);
+        System.arraycopy(jpeg, eoi, result, eoi + count, jpeg.length - eoi);
+        return result;
+    }
+
+    /** Returns the index of the Se byte in the SOS header. */
+    private static int sosSeIndex(byte[] jpeg) {
+        int i = 2;
+        while (i + 4 <= jpeg.length) {
+            assertEquals(0xff, jpeg[i] & 0xff, "Expected a JPEG marker");
+            int marker = jpeg[i + 1] & 0xff;
+            int length = ((jpeg[i + 2] & 0xff) << 8) | (jpeg[i + 3] & 0xff);
+            if (marker == 0xda) {
+                int components = jpeg[i + 4] & 0xff;
+                // Ns, then two bytes for each component, then Ss, then Se.
+                return i + 4 + 1 + 2 * components + 1;
+            }
+            i += length + 2;
+        }
+        throw new AssertionError("The JPEG has no SOS marker");
+    }
+
+    private static Path writeBytes(String name, byte[] bytes) throws IOException {
+        Path path = tempDir.resolve(name);
+        Files.write(path, bytes);
+        return path;
+    }
+
+    private static Mat grabFirstFrameCopy(GStreamerCapture capture) {
+        // The first grab decodes the first sample in the caller. A rejected sample gives null.
+        GStreamerFrame frame = capture.grab(2000);
+        assertNotNull(frame, "The first grab must give a frame");
+        CVMat mat = frame.toCVMat();
+        try {
+            return mat.getMat().clone();
+        } finally {
+            mat.release();
+        }
+    }
+
+    @Test
+    public void jpegWithShortPaddingBeforeEoiIsDeliveredAtOnce() throws IOException {
+        assumeCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE | GStreamerCaptureJNI.CAP_STATS);
+        assumeElement("multifilesrc");
+
+        Mat source = makeTestImage(640, 480, true);
+        Path file = writeJpeg("padsource.jpg", source, Imgcodecs.IMWRITE_JPEG_QUALITY, 90);
+        Mat expected = Imgcodecs.imread(file.toString(), Imgcodecs.IMREAD_GRAYSCALE);
+        Path padded = writeBytes("pad12.jpg", padBeforeEoi(Files.readAllBytes(file), 12));
+
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(jpegFilePipeline(padded), GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            Mat actual = grabFirstFrameCopy(capture);
+            assertSamePixels(expected, actual, "JPEG with 12 padding bytes");
+            actual.release();
+            for (int i = 0; i < 5; i++) {
+                actual = grabCopy(capture, 1);
+                assertSamePixels(expected, actual, "JPEG with 12 padding bytes, frame " + i);
+                actual.release();
+            }
+            assertEquals(0, capture.getStats().corruptFrames());
+        }
+    }
+
+    @Test
+    public void intermittentPaddingDoesNotDropFrames() throws IOException {
+        assumeCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE | GStreamerCaptureJNI.CAP_STATS);
+        assumeElement("multifilesrc");
+
+        Mat sourceA = makeTestImage(320, 240, true);
+        Mat sourceB = new Mat();
+        Core.flip(sourceA, sourceB, 1);
+        Path fileA = writeJpeg("altsourceA.jpg", sourceA, Imgcodecs.IMWRITE_JPEG_QUALITY, 90);
+        Path fileB = writeJpeg("altsourceB.jpg", sourceB, Imgcodecs.IMWRITE_JPEG_QUALITY, 90);
+        Mat expectedA = Imgcodecs.imread(fileA.toString(), Imgcodecs.IMREAD_GRAYSCALE);
+        Mat expectedB = Imgcodecs.imread(fileB.toString(), Imgcodecs.IMREAD_GRAYSCALE);
+        // Frame 0 is clean. Frame 1 has 64 padding bytes before EOI.
+        writeBytes("alt-0.jpg", Files.readAllBytes(fileA));
+        writeBytes("alt-1.jpg", padBeforeEoi(Files.readAllBytes(fileB), 64));
+        String pipeline =
+                "multifilesrc location=\""
+                        + tempDir.resolve("alt-%d.jpg")
+                        + "\" start-index=0 stop-index=1 loop=true caps=image/jpeg,framerate=30/1 ! "
+                        + APPSINK;
+
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(pipeline, GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            int countA = 0;
+            int countB = 0;
+            int delivered = 0;
+            int grabs = 0;
+            while (delivered < 400 && grabs < 2000) {
+                grabs++;
+                GStreamerFrame frame = capture.grab(500);
+                if (frame == null) {
+                    continue;
+                }
+                delivered++;
+                CVMat mat = frame.toCVMat();
+                try {
+                    Mat image = mat.getMat();
+                    assertEquals(expectedA.size(), image.size());
+                    Mat difference = new Mat();
+                    Core.absdiff(expectedA, image, difference);
+                    boolean isA = Core.countNonZero(difference) == 0;
+                    Core.absdiff(expectedB, image, difference);
+                    boolean isB = Core.countNonZero(difference) == 0;
+                    difference.release();
+                    assertTrue(isA || isB, "Frame " + delivered + " is not one of the two pictures");
+                    countA += isA ? 1 : 0;
+                    countB += isB ? 1 : 0;
+                } finally {
+                    mat.release();
+                }
+            }
+            assertEquals(400, delivered, "The capture must deliver 400 frames");
+            assertTrue(countA > 0, "The clean picture must be delivered");
+            assertTrue(countB > 0, "The padded picture must be delivered");
+            GStreamerCapture.Stats stats = capture.getStats();
+            assertTrue(
+                    stats.corruptFrames() <= 40, "Too many frames dropped: " + stats.corruptFrames());
+        }
+    }
+
+    @Test
+    public void jpegWithNonSequentialSosParametersIsDelivered() throws IOException {
+        assumeCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE | GStreamerCaptureJNI.CAP_STATS);
+        assumeElement("multifilesrc");
+
+        Mat source = makeTestImage(640, 480, true);
+        Path file = writeJpeg("sossource.jpg", source, Imgcodecs.IMWRITE_JPEG_QUALITY, 90);
+        Mat expected = Imgcodecs.imread(file.toString(), Imgcodecs.IMREAD_GRAYSCALE);
+        byte[] bytes = Files.readAllBytes(file);
+        int se = sosSeIndex(bytes);
+        assertEquals(0x3f, bytes[se] & 0xff, "Se of a baseline JPEG");
+        bytes[se] = 0;
+        Path changed = writeBytes("sose0.jpg", bytes);
+
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(jpegFilePipeline(changed), GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            Mat actual = grabFirstFrameCopy(capture);
+            assertSamePixels(expected, actual, "JPEG with Se = 0");
+            actual.release();
+            for (int i = 0; i < 5; i++) {
+                actual = grabCopy(capture, 1);
+                assertSamePixels(expected, actual, "JPEG with Se = 0, frame " + i);
+                actual.release();
+            }
+            assertEquals(0, capture.getStats().corruptFrames());
+        }
+    }
+
+    @Test
+    public void jpegWithoutEoiMarkerIsDelivered() throws IOException {
+        assumeCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE | GStreamerCaptureJNI.CAP_STATS);
+        assumeElement("multifilesrc");
+
+        Mat source = makeTestImage(640, 480, true);
+        Path file = writeJpeg("eofsource.jpg", source, Imgcodecs.IMWRITE_JPEG_QUALITY, 90);
+        Mat expected = Imgcodecs.imread(file.toString(), Imgcodecs.IMREAD_GRAYSCALE);
+        byte[] bytes = Files.readAllBytes(file);
+        assertEquals(bytes.length - 2, lastEoiIndex(bytes));
+        Path noEoi = writeBytes("noeoi.jpg", java.util.Arrays.copyOf(bytes, bytes.length - 2));
+
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(jpegFilePipeline(noEoi), GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            Mat actual = grabCopy(capture, 1);
+            assertSamePixels(expected, actual, "JPEG without EOI");
+            actual.release();
+            // Frames are rejected only until the tolerance starts. After that no frame is rejected,
+            // so this count is the number of samples before the first delivered frame.
+            GStreamerCapture.Stats stats = capture.getStats();
+            assertTrue(
+                    stats.corruptFrames() + stats.decodeErrors() < 100,
+                    "Too many samples before the first frame: " + stats.corruptFrames());
+            for (int i = 0; i < 5; i++) {
+                actual = grabCopy(capture, 1);
+                assertSamePixels(expected, actual, "JPEG without EOI, frame " + i);
+                actual.release();
+            }
+        }
+    }
+
+    private static boolean wrapBufferEnabled() {
+        String value = System.getenv("PV_GSTREAMER_CAPTURE_WRAP_BUFFER");
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        value = value.trim().toLowerCase();
+        return !value.equals("0") && !value.equals("false") && !value.equals("no") && !value.equals("off");
+    }
+
+    @Test
+    public void lumaPlaneFrameIsCopiedAndCanBeWritten() {
+        assumeCapability(GStreamerCaptureJNI.CAP_LUMA_FORMATS | GStreamerCaptureJNI.CAP_STATS);
+        assumeElement("videotestsrc");
+
+        String pipeline =
+                "videotestsrc ! video/x-raw,format=NV12,width=326,height=242 ! " + APPSINK;
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(pipeline, GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            GStreamerFrame frame = capture.grab(2000);
+            assertNotNull(frame);
+            CVMat mat = frame.toCVMat();
+            // An in-place write, as RotateImagePipe and the crosshair drawing do.
+            mat.getMat().setTo(new Scalar(0));
+            mat.release();
+            for (int i = 0; i < 5; i++) {
+                GStreamerFrame next = capture.grab(2000);
+                assertNotNull(next);
+                next.toCVMat().release();
+            }
+            assertTrue(
+                    capture.getStats().convertNanosSum() > 0,
+                    "A luma plane must be copied out of the GStreamer buffer");
+        }
+    }
+
+    @Test
+    public void convertedBgrFrameKeepsZeroCopyWhenWrapIsOn() {
+        assumeCapability(GStreamerCaptureJNI.CAP_STATS);
+        assumeElement("videotestsrc");
+        assumeElement("videoconvert");
+
+        String pipeline =
+                "videotestsrc ! video/x-raw,width=320,height=240 ! videoconvert ! video/x-raw,format=BGR ! "
+                        + APPSINK;
+        try (GStreamerCapture capture = GStreamerCapture.open(pipeline)) {
+            assertNotNull(capture);
+            for (int i = 0; i < 5; i++) {
+                GStreamerFrame frame = capture.grab(2000);
+                assertNotNull(frame);
+                assertEquals(3, frame.channels());
+                frame.toCVMat().release();
+            }
+            long convertNanos = capture.getStats().convertNanosSum();
+            if (wrapBufferEnabled()) {
+                assertEquals(0, convertNanos, "The legacy pipeline output must stay zero-copy");
+            } else {
+                assertTrue(convertNanos > 0, "Without the wrap option each frame is copied");
+            }
+        }
+    }
+
+    /** Counts the threads of this process that have the policy SCHED_FIFO (1). */
+    static int countFifoThreads() throws IOException {
+        int count = 0;
+        try (var tasks = Files.list(Path.of("/proc/self/task"))) {
+            for (Path task : (Iterable<Path>) tasks::iterator) {
+                String stat;
+                try {
+                    stat = Files.readString(task.resolve("stat"));
+                } catch (IOException e) {
+                    // The thread ended.
+                    continue;
+                }
+                // Field 2 (the name) can contain spaces. The fields after it start at field 3.
+                String[] fields = stat.substring(stat.lastIndexOf(')') + 2).trim().split(" ");
+                if (fields.length > 38 && fields[41 - 3].equals("1")) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Runs in a separate JVM, because the library reads PV_GSTREAMER_CAPTURE_RT_PRIORITY only once
+     * and the other tests must not run at real-time priority. Prints the thread counts.
+     */
+    public static final class RealtimePriorityProbe {
+        public static void main(String[] args) throws Exception {
+            run();
+            // Library threads that are not daemon threads would keep this JVM alive.
+            System.out.flush();
+            System.exit(0);
+        }
+
+        private static void run() throws Exception {
+            LoadJNI.loadLibraries();
+            if (!GStreamerCapture.isAvailable()) {
+                System.out.println("PV-RESULT unavailable");
+                return;
+            }
+            int during;
+            try (GStreamerCapture capture =
+                    GStreamerCapture.open(
+                            "videotestsrc is-live=true ! jpegenc ! " + APPSINK,
+                            GStreamerCaptureJNI.OUTPUT_GRAY)) {
+                if (capture == null) {
+                    System.out.println("PV-RESULT open-failed");
+                    return;
+                }
+                for (int i = 0; i < 10; i++) {
+                    GStreamerFrame frame = capture.grab(2000);
+                    if (frame != null) {
+                        frame.toCVMat().release();
+                    }
+                }
+                during = countFifoThreads();
+            }
+            Thread.sleep(200);
+            int after = countFifoThreads();
+
+            int legacy;
+            String legacyPipeline =
+                    "videotestsrc is-live=true ! video/x-raw,width=640,height=480,framerate=30/1"
+                            + " ! jpegenc ! queue max-size-buffers=1 leaky=downstream ! jpegparse ! jpegdec"
+                            + " ! videoconvert ! video/x-raw,format=BGR ! "
+                            + APPSINK;
+            try (GStreamerCapture capture = GStreamerCapture.open(legacyPipeline)) {
+                if (capture == null) {
+                    System.out.println("PV-RESULT open-failed");
+                    return;
+                }
+                for (int i = 0; i < 10; i++) {
+                    GStreamerFrame frame = capture.grab(2000);
+                    if (frame != null) {
+                        frame.toCVMat().release();
+                    }
+                }
+                legacy = countFifoThreads();
+            }
+            System.out.println("PV-RESULT " + during + " " + after + " " + legacy);
+        }
+    }
+
+    @Test
+    public void realtimePriorityIsRestoredWhenTheStreamingThreadLeaves() throws Exception {
+        assumeCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE);
+        assumeElement("videotestsrc");
+        assumeElement("jpegenc");
+        assumeElement("jpegparse");
+        assumeElement("jpegdec");
+        assumeTrue(Files.isDirectory(Path.of("/proc/self/task")), "Needs Linux /proc");
+
+        String javaBinary = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        ProcessBuilder builder =
+                new ProcessBuilder(
+                        javaBinary,
+                        "-cp",
+                        System.getProperty("java.class.path"),
+                        RealtimePriorityProbe.class.getName());
+        builder.environment().put("PV_GSTREAMER_CAPTURE_RT_PRIORITY", "10");
+        builder.redirectErrorStream(true);
+        Path log = tempDir.resolve("rt-probe.log");
+        builder.redirectOutput(log.toFile());
+        Process process = builder.start();
+        boolean ended = process.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+        if (!ended) {
+            process.destroyForcibly();
+        }
+        String output = Files.readString(log);
+        assertTrue(ended, "The probe process did not end: " + output);
+        String result = null;
+        for (String line : output.split("\n")) {
+            if (line.startsWith("PV-RESULT ")) {
+                result = line.substring("PV-RESULT ".length()).trim();
+            }
+        }
+        assertNotNull(result, "The probe process gave no result: " + output);
+        assumeTrue(!result.equals("unavailable"), "The probe process could not load the library");
+        String[] counts = result.split(" ");
+        assertEquals(3, counts.length, "Probe result: " + output);
+        int during = Integer.parseInt(counts[0]);
+        int after = Integer.parseInt(counts[1]);
+        int legacy = Integer.parseInt(counts[2]);
+        System.out.println(
+                "[capture] SCHED_FIFO threads: during=" + during + " after=" + after + " legacy=" + legacy);
+        assumeTrue(during > 0, "No thread got SCHED_FIFO. The permission is missing.");
+        assertEquals(0, after, "No thread may keep SCHED_FIFO after the capture is closed");
+        assertEquals(1, legacy, "Only the source thread may have SCHED_FIFO");
+    }
+
     private record RawLayout(String format, int[] planeStrides, int[] planeRows, int lumaStep) {}
 
     private static int roundUp4(int value) {

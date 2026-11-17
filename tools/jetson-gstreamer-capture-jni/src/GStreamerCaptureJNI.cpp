@@ -233,14 +233,31 @@ int realtimePriorityFromEnvironment() {
   return priority;
 }
 
+// GStreamer streaming threads come from a shared thread pool. After a capture stops, a thread can
+// run a task of another pipeline (for example the legacy software decode). So the policy before
+// the change is kept here, and the bus sync handler restores it when the task leaves the thread.
+thread_local bool realtimePromoted = false;
+thread_local int realtimeSavedPolicy = SCHED_OTHER;
+thread_local sched_param realtimeSavedParam {};
+// True after the source probe tried to set the priority on this thread.
+thread_local bool sourceThreadPriorityApplied = false;
+
 void applyRealtimePriorityToCurrentThread(const char* threadName) {
   const int priority = realtimePriorityFromEnvironment();
   if (priority <= 0) {
     return;
   }
+  int savedPolicy = SCHED_OTHER;
+  sched_param savedParam {};
+  const bool saved = pthread_getschedparam(pthread_self(), &savedPolicy, &savedParam) == 0;
   sched_param param {};
   param.sched_priority = priority;
   const int error = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+  if (error == 0 && saved && !realtimePromoted) {
+    realtimePromoted = true;
+    realtimeSavedPolicy = savedPolicy;
+    realtimeSavedParam = savedParam;
+  }
   if (error != 0) {
     static std::atomic<bool> reported {false};
     if (!reported.exchange(true)) {
@@ -474,7 +491,10 @@ struct Capture {
   std::atomic<int64_t> decodeNanosAverage {0};
   std::atomic<int64_t> sourcePeriodNanosAverage {0};
   int64_t lastSourceNanos = 0;
-  int consecutiveExtraneousOnly = 0;
+  // Window counts for suspect JPEG frames (see frameFromJpegSample). Only the thread that
+  // decodes writes these fields.
+  int jpegWindowFrames = 0;
+  int jpegWindowSuspect = 0;
   bool unsupportedFormatLogged = false;
 };
 
@@ -585,9 +605,8 @@ GstPadProbeReturn sourceBufferProbe(GstPad*, GstPadProbeInfo* info, gpointer use
   }
 
   // This function runs on the GStreamer thread that takes the frames from the camera.
-  static thread_local bool priorityApplied = false;
-  if (!priorityApplied) {
-    priorityApplied = true;
+  if (!sourceThreadPriorityApplied) {
+    sourceThreadPriorityApplied = true;
     applyRealtimePriorityToCurrentThread("camera source");
   }
 
@@ -719,6 +738,23 @@ jlong ptsEstimatedAgeNanos(Capture* capture, GstBuffer* buffer) {
   }
 
   return static_cast<jlong>(now - absolutePts);
+}
+
+// Runs on the thread that posts the message. GStreamer posts STREAM_STATUS LEAVE from the
+// streaming thread itself when its task ends, so the restore below acts on the correct thread.
+// It passes each message on, so logBusFailure still sees errors.
+GstBusSyncReply restorePriorityBusHandler(GstBus*, GstMessage* message, gpointer) {
+  if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_STREAM_STATUS) {
+    GstStreamStatusType type = GST_STREAM_STATUS_TYPE_CREATE;
+    GstElement* owner = nullptr;
+    gst_message_parse_stream_status(message, &type, &owner);
+    if (type == GST_STREAM_STATUS_TYPE_LEAVE && realtimePromoted) {
+      pthread_setschedparam(pthread_self(), realtimeSavedPolicy, &realtimeSavedParam);
+      realtimePromoted = false;
+      sourceThreadPriorityApplied = false;
+    }
+  }
+  return GST_BUS_PASS;
 }
 
 bool logBusFailure(Capture* capture) {
@@ -994,7 +1030,10 @@ RawFormat classifyRawFormat(const GstVideoInfo* info) {
   }
 
   const GstVideoFormatInfo* finfo = info->finfo;
-  if (finfo == nullptr || !GST_VIDEO_FORMAT_INFO_IS_YUV(finfo) ||
+  // In a tiled format the stride value is a tile count, not a byte count. A copy with that value
+  // would read outside the buffer.
+  if (finfo == nullptr || GST_VIDEO_FORMAT_INFO_IS_TILED(finfo) ||
+      !GST_VIDEO_FORMAT_INFO_IS_YUV(finfo) ||
       GST_VIDEO_FORMAT_INFO_DEPTH(finfo, 0) != 8 || GST_VIDEO_FORMAT_INFO_PLANE(finfo, 0) != 0) {
     return result;
   }
@@ -1080,7 +1119,21 @@ FrameHolder* frameFromRawSample(Capture* capture, GstSample* sample, GstCaps* ca
   holder->channels = format.channels;
   fillTimestamps(capture, holder.get(), holder->buffer);
 
-  const bool mustCopy = format.layout == RawLayout::PackedLuma || !capture->wrapMappedBuffer;
+  // Java can write into the Mat in place (RotateImagePipe, the crosshair drawing). The mapping is
+  // read-only, and for camera or decoder buffers (dmabuf) the pages are PROT_READ, so a write
+  // stops the JVM. Wrap only interleaved frames in writable system memory, as from videoconvert.
+  // All other frames are copied, and the GStreamer buffer goes back at once, so a frame in the
+  // pipeline does not keep a camera buffer.
+  bool wrapAllowed = capture->wrapMappedBuffer && format.layout == RawLayout::Interleaved;
+  const guint memoryCount = wrapAllowed ? gst_buffer_n_memory(holder->buffer) : 0;
+  for (guint i = 0; i < memoryCount && wrapAllowed; ++i) {
+    GstMemory* memory = gst_buffer_peek_memory(holder->buffer, i);
+    if (memory == nullptr || !gst_memory_is_type(memory, GST_ALLOCATOR_SYSMEM) ||
+        GST_MEMORY_IS_READONLY(memory)) {
+      wrapAllowed = false;
+    }
+  }
+  const bool mustCopy = !wrapAllowed;
   if (!mustCopy) {
     // Zero-copy: the Mat points into the GStreamer buffer. The holder keeps the buffer mapped.
     holder->mat = new cv::Mat(
@@ -1180,8 +1233,15 @@ void ensureStandardHuffmanTables(j_decompress_ptr cinfo) {
 struct JpegErrorManager {
   jpeg_error_mgr pub;
   jmp_buf jump;
+  // Fatal: libjpeg invented pixel data.
   bool dataDamaged = false;
-  bool extraneousBytes = false;
+  // The EOI marker is missing. All entropy data was there, else libjpeg also gives
+  // JWRN_HIT_MARKER, which sets dataDamaged.
+  bool prematureEof = false;
+  // Bytes that libjpeg skipped before markers.
+  unsigned extraneousBytesTotal = 0;
+  // True while each skipped byte was before the EOI marker, after all MCUs were decoded.
+  bool extraneousOnlyBeforeEoi = true;
   char message[JMSG_LENGTH_MAX] = {};
 };
 
@@ -1193,16 +1253,35 @@ void jpegErrorExit(j_common_ptr cinfo) {
 
 // libjpeg reports damaged input as a warning and continues with invented pixel data. A frame
 // with invented pixels must not go to the tag detector, so the warning type is recorded here.
+// Some warnings are harmless: the pixels are decoded completely. Cameras can give these on each
+// frame, so they must not reject the frame.
 void jpegEmitMessage(j_common_ptr cinfo, int level) {
   if (level >= 0) {
     return;
   }
   auto* manager = reinterpret_cast<JpegErrorManager*>(cinfo->err);
   cinfo->err->num_warnings++;
-  if (cinfo->err->msg_code == JWRN_EXTRANEOUS_DATA) {
-    manager->extraneousBytes = true;
-  } else {
-    manager->dataDamaged = true;
+  switch (cinfo->err->msg_code) {
+    case JWRN_EXTRANEOUS_DATA:
+      // msg_parm.i[0] is the count of skipped bytes, msg_parm.i[1] is the marker after them.
+      manager->extraneousBytesTotal += static_cast<unsigned>(std::max(0, cinfo->err->msg_parm.i[0]));
+      if (cinfo->err->msg_parm.i[1] != 0xD9) {
+        manager->extraneousOnlyBeforeEoi = false;
+      }
+      break;
+    case JWRN_JPEG_EOF:
+      manager->prematureEof = true;
+      break;
+    case JWRN_NOT_SEQUENTIAL:
+    case JWRN_JFIF_MAJOR:
+    case JWRN_ADOBE_XFORM:
+      // Harmless. The pixels are decoded completely.
+      break;
+    default:
+      // JWRN_HIT_MARKER, JWRN_HUFF_BAD_CODE, JWRN_MUST_RESYNC, JWRN_BOGUS_PROGRESSION,
+      // JWRN_TOO_MUCH_DATA and unknown codes: the pixels can be invented.
+      manager->dataDamaged = true;
+      break;
   }
 }
 
@@ -1231,7 +1310,9 @@ struct JpegDecoder {
   JpegDecoder& operator=(const JpegDecoder&) = delete;
 };
 
-enum class JpegResult { Ok, Error, Damaged };
+// Suspect: the pixels are complete, but the frame had skipped bytes or no EOI marker. The caller
+// decides if it accepts the frame.
+enum class JpegResult { Ok, Error, Damaged, Suspect };
 
 // Decodes one JPEG image into `out` (tight stride). When wantGray is true only the luma component
 // is decoded: libjpeg skips the inverse DCT, the upsampling and the color conversion of the
@@ -1249,7 +1330,9 @@ JpegResult decodeJpeg(
 
   jpeg_decompress_struct* cinfo = &decoder->cinfo;
   decoder->error.dataDamaged = false;
-  decoder->error.extraneousBytes = false;
+  decoder->error.prematureEof = false;
+  decoder->error.extraneousBytesTotal = 0;
+  decoder->error.extraneousOnlyBeforeEoi = true;
   decoder->error.pub.num_warnings = 0;
 
   if (setjmp(decoder->error.jump) != 0) {
@@ -1340,8 +1423,13 @@ JpegResult decodeJpeg(
   *outWidth = width;
   *outHeight = height;
   *outChannels = channels;
-  return decoder->error.dataDamaged || decoder->error.extraneousBytes ? JpegResult::Damaged
-                                                                      : JpegResult::Ok;
+  if (decoder->error.dataDamaged) {
+    return JpegResult::Damaged;
+  }
+  if (decoder->error.extraneousBytesTotal > 0 || decoder->error.prematureEof) {
+    return JpegResult::Suspect;
+  }
+  return JpegResult::Ok;
 }
 
 // Builds a frame from a compressed JPEG sample. Takes ownership of `sample` in all cases.
@@ -1365,9 +1453,10 @@ FrameHolder* frameFromJpegSample(Capture* capture, JpegDecoder* decoder, GstSamp
   const JpegResult result = decodeJpeg(
       decoder, capture->pool.get(), map.data, map.size, capture->outputMode == kOutputGray,
       &pixels, &width, &height, &channels);
-  const bool extraneousOnly =
-      result == JpegResult::Damaged && !decoder->error.dataDamaged &&
-      decoder->error.extraneousBytes;
+  // Copy the warning fields now. The test-only extra decode below resets them.
+  const bool prematureEof = decoder->error.prematureEof;
+  const unsigned extraneousBytesTotal = decoder->error.extraneousBytesTotal;
+  const bool extraneousOnlyBeforeEoi = decoder->error.extraneousOnlyBeforeEoi;
 
   // Test aid: extra decode work to simulate a slower processor. The pixels are discarded.
   for (int extra = testExtraDecodePercent.load(std::memory_order_relaxed); extra > 0;
@@ -1390,27 +1479,33 @@ FrameHolder* frameFromJpegSample(Capture* capture, JpegDecoder* decoder, GstSamp
     return nullptr;
   }
 
-  if (result == JpegResult::Damaged) {
-    bool accept = false;
-    if (extraneousOnly) {
-      // "Extraneous bytes" can be damage, or it can be padding that a camera adds to each frame.
-      // If each frame has this warning, it is padding, and the frames are accepted.
-      if (capture->tolerateExtraneousJpegBytes) {
-        accept = true;
-      } else if (++capture->consecutiveExtraneousOnly >= 30) {
-        capture->tolerateExtraneousJpegBytes = true;
-        accept = true;
-        std::cerr << "[GStreamer Capture JNI] Each JPEG frame has extraneous bytes. The camera "
-                     "adds padding. These frames are now accepted.\n";
-      }
+  // A window of 600 decoded frames. A clean frame does not reset the counts, because a camera
+  // that pads its frames gives the warning only on a part of the frames: the bit reader
+  // frequently takes the padding without a warning.
+  if (++capture->jpegWindowFrames >= 600 && !capture->tolerateExtraneousJpegBytes) {
+    capture->jpegWindowFrames = 0;
+    capture->jpegWindowSuspect = 0;
+  }
+
+  bool accept = result == JpegResult::Ok;
+  if (result == JpegResult::Suspect) {
+    if (capture->tolerateExtraneousJpegBytes) {
+      accept = true;
+    } else if (!prematureEof && extraneousOnlyBeforeEoi && extraneousBytesTotal <= 16) {
+      // Alignment padding before EOI. All MCUs were decoded before the skipped bytes.
+      accept = true;
+    } else if (++capture->jpegWindowSuspect >= 30) {
+      // Damage does not come this often. The camera adds padding or does not send EOI.
+      capture->tolerateExtraneousJpegBytes = true;
+      accept = true;
+      std::cerr << "[GStreamer Capture JNI] Each JPEG frame has extraneous bytes. The camera "
+                   "adds padding. These frames are now accepted.\n";
     }
-    if (!accept) {
-      capture->pool->release(pixels);
-      capture->stats.corruptFrames.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
-    }
-  } else {
-    capture->consecutiveExtraneousOnly = 0;
+  }
+  if (!accept) {
+    capture->pool->release(pixels);
+    capture->stats.corruptFrames.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
   }
 
   holder->pooled = pixels;
@@ -1672,6 +1767,12 @@ jlong createCapture(const std::string& pipelineText, int outputMode) {
   }
 
   installSourceProbe(capture.get());
+
+  GstBus* bus = gst_element_get_bus(capture->pipeline);
+  if (bus != nullptr) {
+    gst_bus_set_sync_handler(bus, restorePriorityBusHandler, nullptr, nullptr);
+    gst_object_unref(bus);
+  }
 
   GstStateChangeReturn stateResult = gst_element_set_state(capture->pipeline, GST_STATE_PLAYING);
   if (stateResult == GST_STATE_CHANGE_FAILURE) {
