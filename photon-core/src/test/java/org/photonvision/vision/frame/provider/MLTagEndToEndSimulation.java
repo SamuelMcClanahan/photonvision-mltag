@@ -160,8 +160,8 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * and JPEG factor 2.1; the runs used k = 1.7, 2.0 and 2.6. The JPEG decode is slower on the RK3588
  * than the general factor shows.
  *
- * <p>PV_MLTAG_SIM_LANES (1 to 4) replaces the lane count of the board profile for all scenarios
- * of the run, as PV_MLTAG_SIM_INFERENCE_MS replaces the inference time. It lets you measure other
+ * <p>PV_MLTAG_SIM_LANES (1 to 4) replaces the lane count of the board profile for all scenarios of
+ * the run, as PV_MLTAG_SIM_INFERENCE_MS replaces the inference time. It lets you measure other
  * values of PV_MLTAG_INFERENCE_LANES without a code change.
  *
  * <p>The run scripts set PV_OPENCV_THREADS=1 and PV_GSTREAMER_CAPTURE_RT_PRIORITY=10. Use the same
@@ -2405,8 +2405,8 @@ public class MLTagEndToEndSimulation {
     }
 
     /**
-     * Reads PV_MLTAG_SIM_LANES. It replaces the lane count of the board profile, so a run can
-     * measure other lane counts without a code change.
+     * Reads PV_MLTAG_SIM_LANES. It replaces the lane count of the board profile, so a run can measure
+     * other lane counts without a code change.
      *
      * @return The lane count of the setting, or the lane count of the board if it is not set.
      */
