@@ -148,6 +148,17 @@ public class PipelineManager {
     }
 
     /**
+     * Releases the current user pipeline. Call this only when no thread runs a pipeline of this
+     * manager any more, for example after the vision thread of the module ended. The built-in
+     * pipelines keep no resources.
+     */
+    public void release() {
+        if (currentUserPipeline != null && currentUserPipeline != driverModePipeline) {
+            currentUserPipeline.release();
+        }
+    }
+
+    /**
      * Get the currently active pipeline.
      *
      * @return The currently active pipeline.

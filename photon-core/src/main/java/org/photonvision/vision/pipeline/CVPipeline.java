@@ -86,12 +86,33 @@ public abstract class CVPipeline<R extends CVPipelineResult, S extends CVPipelin
             return null;
         }
 
-        // The result can be for an earlier frame than the input frame of this call. The capture
-        // time must always be the capture time of the frame that the result is for.
-        Frame resultFrame = result.inputAndOutputFrame != null ? result.inputAndOutputFrame : frame;
-        result.setImageCaptureTimestampNanos(resultFrame.timestampNanos);
+        // The capture time must always be the capture time of the camera frame that the result is
+        // computed from. Some pipelines put a new output Frame into the result, so the result frame
+        // is not that camera frame in general.
+        result.setImageCaptureTimestampNanos(getResultSourceFrame(result, frame).timestampNanos);
 
         return result;
+    }
+
+    /**
+     * Returns the camera frame that a result was computed from. This is the input frame of the call
+     * for most pipelines. A pipeline that can return the result of an earlier frame (see
+     * AprilTagPipeline) overrides this.
+     *
+     * @param result The result of a call of {@link #run}.
+     * @param inputFrame The input frame of that call.
+     */
+    public Frame getResultSourceFrame(R result, Frame inputFrame) {
+        return inputFrame;
+    }
+
+    /**
+     * Returns a result of a frame that the pipeline kept in work and that is complete now, or null.
+     * VisionRunner calls this when there is no camera frame for a call of {@link #run}, so these
+     * results are not lost. Most pipelines keep no frame between calls and return null.
+     */
+    public R pollCompletedResult() {
+        return null;
     }
 
     /**

@@ -21,9 +21,12 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.opencv.core.RotatedRect;
 import org.photonvision.common.configuration.ConfigManager;
@@ -95,7 +98,12 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     private int lastPipeParamsHash = 0;
 
     // Frames that are in work. Only used when the hybrid pipe has more than one inference lane.
-    private record PendingFrame(Frame frame, Future<CVPipelineResult> result) {}
+    // The detection is kept so that a frame whose work task was cancelled is released only after
+    // its lane does not use it.
+    private record PendingFrame(
+            Frame frame,
+            AprilTagMLHybridPipe.PendingDetection detection,
+            Future<CVPipelineResult> result) {}
 
     private final ArrayDeque<PendingFrame> pendingFrames = new ArrayDeque<>();
     private InferenceOverlapController overlapController;
@@ -383,7 +391,8 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             final var detection = mlHybridPipe.submit(frame);
             final AprilTagPipelineSettings frameSettings = settings;
             pendingFrames.addLast(
-                    new PendingFrame(frame, frameWorker.submit(() -> finishFrame(detection, frameSettings))));
+                    new PendingFrame(
+                            frame, detection, frameWorker.submit(() -> finishFrame(detection, frameSettings))));
             if (action == InferenceOverlapController.Action.DEFER) {
                 overlapController.onCallEnd(System.nanoTime(), -1);
                 return null;
@@ -392,11 +401,52 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
 
         var pending = pendingFrames.removeFirst();
         CVPipelineResult result = awaitResult(pending);
+        if (result == null) {
+            // The processing of this frame failed. As in the one-lane path, it gives no result.
+            pending.frame().release();
+            overlapController.onCallEnd(System.nanoTime(), -1);
+            return null;
+        }
         overlapController.onCallEnd(System.nanoTime(), lastPostInferenceNanos);
         return result;
     }
 
-    /** Runs on the work thread: the work for one frame that follows the model inference. */
+    /**
+     * Returns the result of the oldest frame in work if it is complete, else null. VisionRunner calls
+     * this when the camera gives no frame or is disabled, so the results of the frames in work are
+     * published and not lost when they become stale.
+     */
+    @Override
+    public CVPipelineResult pollCompletedResult() {
+        PendingFrame pending;
+        while ((pending = pendingFrames.peekFirst()) != null && pending.result().isDone()) {
+            pendingFrames.removeFirst();
+            CVPipelineResult result = awaitResult(pending);
+            if (result == null) {
+                // A failed frame gives no result. Try the next frame.
+                pending.frame().release();
+                continue;
+            }
+            // CVPipeline.run() does not see this result, so set its capture time here.
+            result.setImageCaptureTimestampNanos(result.inputAndOutputFrame.timestampNanos);
+            return result;
+        }
+        return null;
+    }
+
+    @Override
+    public Frame getResultSourceFrame(CVPipelineResult result, Frame inputFrame) {
+        // In the multi-lane mode a result can be for an earlier frame than the input frame. Each
+        // result holds the frame that it was computed from.
+        return result.inputAndOutputFrame != null ? result.inputAndOutputFrame : inputFrame;
+    }
+
+    /**
+     * Runs on the work thread: the work for one frame that follows the model inference.
+     *
+     * @return The result, or null if the processing of the frame failed. In both cases the lane does
+     *     not use the frame when this method returns.
+     */
     private CVPipelineResult finishFrame(
             AprilTagMLHybridPipe.PendingDetection detection, AprilTagPipelineSettings frameSettings) {
         try {
@@ -412,52 +462,74 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             lastPostInferenceNanos = completed.decodeNanos() + System.nanoTime() - buildStart;
             return result;
         } catch (InterruptedException e) {
+            // The work thread is stopped. The frame gives no result, but the caller can release
+            // the frame only after the lane does not use it. Set the flag again after the wait.
+            detection.await();
             Thread.currentThread().interrupt();
+            return null;
+        } catch (Throwable e) {
+            // No failure can return before the lane is done with the frame.
             detection.await();
-            return new CVPipelineResult(detection.frame.sequenceID, 0, 0, List.of(), detection.frame);
-        } catch (Exception e) {
             logger.error("ML AprilTag frame processing failed", e);
-            detection.await();
-            return new CVPipelineResult(detection.frame.sequenceID, 0, 0, List.of(), detection.frame);
+            return null;
         }
     }
 
-    /** Waits for the result of a frame. Always returns a result that owns the frame. */
+    /**
+     * Waits for the result of a frame. An interrupt does not stop the wait, because the lane and the
+     * work thread can still use the frame. The interrupt flag is set again after the wait.
+     *
+     * @return The result that owns the frame, or null if the processing of the frame failed or was
+     *     cancelled. Then the caller must release the frame. In both cases no other thread uses the
+     *     frame when this method returns.
+     */
     private CVPipelineResult awaitResult(PendingFrame pending) {
+        boolean interrupted = false;
         try {
-            CVPipelineResult result = pending.result().get();
-            if (result != null) {
-                return result;
+            while (true) {
+                try {
+                    return pending.result().get();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                } catch (CancellationException e) {
+                    // The work task did not start (release() cancelled it), so it did not wait
+                    // for the lane. Wait for the lane here.
+                    pending.detection().await();
+                    return null;
+                } catch (ExecutionException e) {
+                    logger.error("ML AprilTag frame processing failed", e);
+                    return null;
+                }
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (Exception e) {
-            logger.error("ML AprilTag frame processing failed", e);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
-        return new CVPipelineResult(pending.frame().sequenceID, 0, 0, List.of(), pending.frame());
     }
 
-    /** Releases frames that are too old, for example after this pipeline was not active. */
+    /** Releases the frames in work if the oldest one is too old, for example after a pause. */
     private void discardStalePendingFrames(long newestTimestampNanos) {
-        boolean discarded = false;
-        while (!pendingFrames.isEmpty()
-                && newestTimestampNanos - pendingFrames.peekFirst().frame().timestampNanos
-                        > STALE_PENDING_NANOS) {
-            awaitResult(pendingFrames.removeFirst()).release();
-            discarded = true;
-        }
-        if (discarded) {
+        PendingFrame oldest = pendingFrames.peekFirst();
+        if (oldest != null
+                && newestTimestampNanos - oldest.frame().timestampNanos > STALE_PENDING_NANOS) {
+            // Discard all frames, not only the stale ones. The newer frames are also late, and the
+            // one-frame-at-a-time mode of the controller after the reset needs an empty queue.
+            discardPendingFrames();
             logger.warn("ML AprilTag: frames that were in work for too long were discarded");
-        }
-        if (discarded && overlapController != null) {
-            overlapController.reset();
         }
     }
 
     /** Waits for all frames that are in work and releases them. */
     private void discardPendingFrames() {
-        while (!pendingFrames.isEmpty()) {
-            awaitResult(pendingFrames.removeFirst()).release();
+        PendingFrame pending;
+        while ((pending = pendingFrames.pollFirst()) != null) {
+            CVPipelineResult result = awaitResult(pending);
+            if (result != null) {
+                result.release();
+            } else {
+                pending.frame().release();
+            }
         }
         if (overlapController != null) {
             overlapController.reset();
@@ -535,8 +607,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             }
             AprilTagPoseEstimate[] singleTagPoses = new AprilTagPoseEstimate[usedDetections.size()];
             sumPipeNanosElapsed +=
-                    estimateSingleTagPoses(
-                            usedDetections, needsSingleTagPose, singleTagPoses, frameStaticProperties);
+                    estimateSingleTagPoses(usedDetections, needsSingleTagPose, singleTagPoses);
 
             for (int detectionIndex = 0; detectionIndex < usedDetections.size(); detectionIndex++) {
                 AprilTagDetection detection = usedDetections.get(detectionIndex);
@@ -613,14 +684,12 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
      * @param detections The detections of the frame.
      * @param needsPose Selects the detections that get a pose.
      * @param poses Output: the pose of each selected detection, at the index of the detection.
-     * @param frameStaticProperties The static properties of the frame of the detections.
      * @return The sum of the calculation time of all tags, in nanoseconds.
      */
     private long estimateSingleTagPoses(
             List<AprilTagDetection> detections,
             boolean[] needsPose,
-            AprilTagPoseEstimate[] poses,
-            FrameStaticProperties frameStaticProperties) {
+            AprilTagPoseEstimate[] poses) {
         List<Integer> selected = new ArrayList<>(detections.size());
         for (int i = 0; i < detections.size(); i++) {
             if (needsPose[i]) {
@@ -645,9 +714,11 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             return nanos;
         }
 
-        // Create the calibration matrices on this thread before other threads read them.
-        frameStaticProperties.cameraCalibration.getCameraIntrinsicsMat();
-        frameStaticProperties.cameraCalibration.getDistCoeffsMat();
+        // Create the calibration matrices on this thread before other threads read them. Use the
+        // calibration that the pose pipes read: the frame can have no calibration while poseParams
+        // is still set from an earlier calibration.
+        poseParams.calibration().getCameraIntrinsicsMat();
+        poseParams.calibration().getDistCoeffsMat();
 
         if (posePipes.isEmpty()) {
             posePipes.add(singleTagPoseEstimatorPipe);
@@ -670,17 +741,26 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         }
         estimatePoseGroup(detections, selected, 0, groupCount, poses, groupNanos);
 
+        // Wait for all tasks also when this thread is interrupted: the tasks write into poses and
+        // use the pose pipes. Set the interrupt flag again after the wait.
         boolean failed = false;
+        boolean interrupted = false;
         for (Future<?> future : futures) {
-            try {
-                future.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                failed = true;
-            } catch (Exception e) {
-                logger.error("Parallel pose estimation failed", e);
-                failed = true;
+            while (true) {
+                try {
+                    future.get();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                } catch (ExecutionException | CancellationException e) {
+                    logger.error("Parallel pose estimation failed", e);
+                    failed = true;
+                    break;
+                }
             }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
         if (failed) {
             // All tasks are complete here. Calculate the poses that are missing on this thread.
@@ -739,10 +819,25 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
 
     @Override
     public void release() {
+        // VisionModule.stop() and a pipeline change can both release this pipeline. A second call
+        // does nothing, so no pipe is released two times.
+        if (released) {
+            return;
+        }
+        // A call of run() that starts after this point fails at once and does not use the pipes.
+        released = true;
         discardPendingFrames();
         if (frameWorker != null) {
-            frameWorker.shutdownNow();
-            frameWorker = null;
+            // Cancel the tasks that did not start, so a thread that waits for one of them does not
+            // wait without end. Do not set frameWorker to null: a call of run() that is still in
+            // work must not make a new work thread.
+            for (Runnable task : frameWorker.shutdownNow()) {
+                if (task instanceof Future<?> future) {
+                    future.cancel(false);
+                }
+            }
+            // The work thread uses the decode and pose pipes. Wait for it before they are released.
+            awaitTermination(frameWorker);
         }
         aprilTagDetectionPipe.release();
         singleTagPoseEstimatorPipe.release();
@@ -754,5 +849,31 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         posePipes.clear();
         mlHybridPipe.release();
         super.release();
+    }
+
+    /** Waits up to 2 s for the end of the threads of an executor. An interrupt does not stop it. */
+    private static void awaitTermination(ExecutorService executor) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        boolean interrupted = false;
+        try {
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                try {
+                    if (executor.awaitTermination(Math.max(0, remaining), TimeUnit.NANOSECONDS)) {
+                        return;
+                    }
+                    if (remaining <= 0) {
+                        logger.warn("ML AprilTag: the frame work thread did not end in 2 s");
+                        return;
+                    }
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

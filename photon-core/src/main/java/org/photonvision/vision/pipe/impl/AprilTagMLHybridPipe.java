@@ -21,15 +21,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.opencv.core.Point;
 import org.opencv.core.Rect;
 import org.opencv.core.RotatedRect;
 import org.opencv.core.Size;
+import org.photonvision.common.logging.LogGroup;
+import org.photonvision.common.logging.Logger;
 import org.photonvision.common.util.EnvUtils;
 import org.photonvision.vision.frame.Frame;
 import org.photonvision.vision.opencv.CVMat;
@@ -48,6 +52,8 @@ import org.wpilib.vision.apriltag.AprilTagDetection;
  */
 public class AprilTagMLHybridPipe
         extends CVPipe<Frame, MLDetectionResult, AprilTagMLHybridPipe.Params> implements Releasable {
+    private static final Logger logger = new Logger(AprilTagMLHybridPipe.class, LogGroup.VisionModule);
+
     /**
      * Number of frames that can be in model inference at the same time. Each lane has its own copy of
      * the model. The default is 1: one frame at a time, on the vision thread.
@@ -100,14 +106,29 @@ public class AprilTagMLHybridPipe
             this.future = future;
         }
 
-        /** Waits until the lane does not use the frame. After this the frame can be released. */
+        /**
+         * Waits until the lane does not use the frame. After this the frame can be released. An
+         * interrupt does not stop the wait, because a frame that is released during the inference
+         * gives wrong pixels or a native crash. The interrupt flag is set again after the wait.
+         */
         public void await() {
+            boolean interrupted = false;
             try {
-                future.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (ExecutionException e) {
-                // The frame is not used after a failure.
+                while (true) {
+                    try {
+                        future.get();
+                        return;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    } catch (ExecutionException | CancellationException e) {
+                        // The frame is not used after a failure, or when the task did not start.
+                        return;
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
@@ -292,12 +313,46 @@ public class AprilTagMLHybridPipe
     @Override
     public void release() {
         if (laneExecutor != null) {
-            laneExecutor.shutdownNow();
+            // Cancel the inferences that did not start, so a thread that waits for one of them
+            // does not wait without end.
+            for (Runnable task : laneExecutor.shutdownNow()) {
+                if (task instanceof Future<?> future) {
+                    future.cancel(false);
+                }
+            }
+            // A lane can be in the inference now. Its model must not be released under it.
+            awaitLaneTermination();
         }
         for (AprilTagROIDetectionPipe lane : lanePipes) {
             lane.release();
         }
         roiDecodePipe.release();
+    }
+
+    /** Waits up to 2 s for the end of the lane threads. An interrupt does not stop the wait. */
+    private void awaitLaneTermination() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        boolean interrupted = false;
+        try {
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                try {
+                    if (laneExecutor.awaitTermination(Math.max(0, remaining), TimeUnit.NANOSECONDS)) {
+                        return;
+                    }
+                    if (remaining <= 0) {
+                        logger.warn("ML AprilTag: an inference lane did not end in 2 s");
+                        return;
+                    }
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private List<RotatedRect> filterRawRois(

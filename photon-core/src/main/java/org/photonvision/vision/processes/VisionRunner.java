@@ -261,11 +261,13 @@ public class VisionRunner {
                 // Still feed with blank frames just dont run any pipelines
 
                 frame.release();
+                publishCompletedResults(pipeline);
                 pipelineResultConsumer.accept(new CVPipelineResult(0l, 0, 0, null, new Frame()));
             } else if (pipeline == pipelineSupplier.get()) {
                 if (!enabledSupplier.get()) {
                     // If we are skipping processing due to the camera being disabled, we still want to send a
                     // result with the new frame and settings, just with a null pipeline result
+                    publishCompletedResults(pipeline);
                     pipelineResultConsumer.accept(new CVPipelineResult(0l, 0, 0, null, new Frame()));
                     frame.release();
                     continue;
@@ -290,11 +292,9 @@ public class VisionRunner {
                         continue;
                     }
                     long pipelineDoneNanos = MathUtils.wpiNanoTime();
-                    // The result can be for an earlier frame than the frame of this loop.
-                    Frame resultFrame =
-                            pipelineResult.inputAndOutputFrame != null
-                                    ? pipelineResult.inputAndOutputFrame
-                                    : frame;
+                    // The result can be for an earlier frame than the frame of this loop. Other
+                    // pipelines put a new output Frame into the result, so ask the pipeline.
+                    Frame resultFrame = pipeline.getResultSourceFrame(pipelineResult, frame);
                     long resultFrameTimestampNanos = resultFrame.timestampNanos;
                     long resultEstimatedAgeNanos =
                             resultFrame.captureMetadata != null
@@ -318,6 +318,21 @@ public class VisionRunner {
                 }
                 loopCount++;
             }
+        }
+    }
+
+    /**
+     * Publishes the results of frames that the pipeline kept in work and that are complete. Without
+     * this call they are published only with the next camera frame, or lost when the camera stops.
+     */
+    private void publishCompletedResults(CVPipeline pipeline) {
+        try {
+            CVPipelineResult done;
+            while ((done = pipeline.pollCompletedResult()) != null) {
+                pipelineResultConsumer.accept(done);
+            }
+        } catch (Exception ex) {
+            logger.error("Exception while publishing completed results", ex);
         }
     }
 

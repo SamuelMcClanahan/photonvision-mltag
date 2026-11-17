@@ -380,6 +380,9 @@ public class VisionModule {
         outputFrameSaver.close();
 
         changeSubscriberHandle.stop();
+        // The vision thread ended above, so no thread uses the pipeline now. Release it, else its
+        // frames in work and its threads stay for the life of the process.
+        pipelineManager.release();
         setVisionLEDs(false);
     }
 

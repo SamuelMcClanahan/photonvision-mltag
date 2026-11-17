@@ -17,6 +17,7 @@
 
 package org.photonvision.vision.pipeline;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -82,7 +83,12 @@ public class AprilTagParallelPoseTest {
     private record TagPose(int id, Transform3d best, Transform3d alternate, double ambiguity) {}
 
     private static List<TagPose> run(AprilTagPipeline pipeline, Path image) {
-        var provider = new FileFrameProvider(image, 70.0, 1000, makeCalibration());
+        return run(pipeline, image, makeCalibration());
+    }
+
+    private static List<TagPose> run(
+            AprilTagPipeline pipeline, Path image, CameraCalibrationCoefficients calibration) {
+        var provider = new FileFrameProvider(image, 70.0, 1000, calibration);
         provider.requestFrameThresholdType(pipeline.getThresholdType());
         CVPipelineResult result = pipeline.run(provider.get(), QuirkyCamera.DefaultCamera);
         List<TagPose> poses = new ArrayList<>();
@@ -144,5 +150,30 @@ public class AprilTagParallelPoseTest {
         parallel.release();
         assertTrue(imagesWithSeveralTags >= 2, "The test needs pictures that contain several tags");
         assertTrue(tags >= 5, "The test needs several tags");
+    }
+
+    @Test
+    public void frameWithoutCalibrationAfterACalibratedFrame() {
+        // The user changes to a resolution without calibration. The UI turns off 3D mode with a
+        // second message, so some frames have 3D mode on and no calibration.
+        Path image = TestUtils.getTestImagesPath(false).resolve("2024").resolve("GeneralField1.jpg");
+        var serial = makePipeline(1);
+        var parallel = makePipeline(4);
+        run(serial, image);
+        run(parallel, image);
+
+        List<TagPose> expected = run(serial, image, null);
+        List<TagPose> actual = assertDoesNotThrow(() -> run(parallel, image, null));
+        serial.release();
+        parallel.release();
+
+        assertTrue(expected.size() >= 2, "The test needs a picture with several tags");
+        assertEquals(expected.size(), actual.size(), "number of targets");
+        for (int i = 0; i < expected.size(); i++) {
+            assertEquals(expected.get(i).id(), actual.get(i).id(), "target order");
+            assertEquals(expected.get(i).best(), actual.get(i).best(), "best pose");
+            assertEquals(expected.get(i).alternate(), actual.get(i).alternate(), "alternate pose");
+            assertEquals(expected.get(i).ambiguity(), actual.get(i).ambiguity(), 0.0, "ambiguity");
+        }
     }
 }
