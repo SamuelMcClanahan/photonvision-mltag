@@ -104,8 +104,8 @@ public record GStreamerFrame(
 
     /**
      * The WPILib time minus the monotonic clock. On Linux System.nanoTime() reads CLOCK_MONOTONIC,
-     * the clock of the native library. A pause between the reads would move the offset, so the
-     * WPILib read is between two monotonic reads and a pair with a large gap is read again.
+     * the clock of the native library. A pause between the reads would move the offset, so the WPILib
+     * read is between two monotonic reads and a pair with a large gap is read again.
      */
     static long monotonicToWpiOffsetNanos() {
         long bestOffset = 0;

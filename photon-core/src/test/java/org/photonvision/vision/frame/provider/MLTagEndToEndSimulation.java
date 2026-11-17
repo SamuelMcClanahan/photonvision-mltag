@@ -339,9 +339,9 @@ public class MLTagEndToEndSimulation {
     private static boolean cpuCountNotValid;
 
     /**
-     * The extra JPEG decode percent that the simulation gave the native library last. The library
-     * has no getter, and the value is one setting for the whole process. A test reads this copy to
-     * see that a scenario puts the value back to 0, also after a failure.
+     * The extra JPEG decode percent that the simulation gave the native library last. The library has
+     * no getter, and the value is one setting for the whole process. A test reads this copy to see
+     * that a scenario puts the value back to 0, also after a failure.
      */
     private static volatile int activeExtraDecodePercent;
 
@@ -1102,9 +1102,9 @@ public class MLTagEndToEndSimulation {
      * Makes the reference data for a pose iteration count: a slow camera gives each frame, and a
      * pipeline with one lane and no NPU wait completes each frame before the next frame arrives. The
      * frames go through the same capture library (and in the mjpeg format the same JPEG decoder) as
-     * in the load runs. Only the iteration count is different from the base settings: the model
-     * gives no duplicate regions and does no extra input preparation, because these do not change
-     * the tag data.
+     * in the load runs. Only the iteration count is different from the base settings: the model gives
+     * no duplicate regions and does no extra input preparation, because these do not change the tag
+     * data.
      */
     private static synchronized List<List<double[]>> prepareReference(int numIterations)
             throws Exception {
@@ -1123,8 +1123,7 @@ public class MLTagEndToEndSimulation {
         AprilTagPipelineSettings settings = makeSettings(1.0);
         settings.numIterations = numIterations;
         AprilTagPipeline pipeline =
-                new SimulatedPipeline(
-                        settings, 1, new SimulatedModel(new SimulatedNpu(1, 0, 0.0, 0), 1.0));
+                new SimulatedPipeline(settings, 1, new SimulatedModel(new SimulatedNpu(1, 0, 0.0, 0), 1.0));
         int missing = sceneFrames.length;
         long deadline =
                 System.nanoTime() + sceneFrames.length * sleepMicros * 1000L * 5 + 30_000_000_000L;
@@ -1151,8 +1150,7 @@ public class MLTagEndToEndSimulation {
                     // where the cause is clear.
                     for (double[] values : tags) {
                         for (double value : values) {
-                            assertTrue(
-                                    !Double.isNaN(value), "The reference data of frame " + index + " has NaN");
+                            assertTrue(!Double.isNaN(value), "The reference data of frame " + index + " has NaN");
                         }
                     }
                     reference.set(index, tags);
@@ -1629,8 +1627,7 @@ public class MLTagEndToEndSimulation {
 
         Throwable failure;
 
-        CameraLoop(
-                SimulatedCamera camera, AprilTagPipeline pipeline, List<List<double[]>> reference) {
+        CameraLoop(SimulatedCamera camera, AprilTagPipeline pipeline, List<List<double[]>> reference) {
             this.camera = camera;
             this.pipeline = pipeline;
             this.reference = reference;
@@ -1896,8 +1893,7 @@ public class MLTagEndToEndSimulation {
             }
 
             var os =
-                    (com.sun.management.OperatingSystemMXBean)
-                            ManagementFactory.getOperatingSystemMXBean();
+                    (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
             // Warm-up: JIT compile, detector creation, start of the inference overlap. The tag data
             // of the results in the warm-up is compared too (see CameraLoop), only the timing
@@ -2033,9 +2029,7 @@ public class MLTagEndToEndSimulation {
                 for (CameraLoop loop : loops) {
                     for (int i = 1; i < loop.resultTimesNanos.size(); i++) {
                         double ms =
-                                (loop.resultTimesNanos.get(i) - loop.resultTimesNanos.get(i - 1))
-                                        / 1e6
-                                        * timeScale;
+                                (loop.resultTimesNanos.get(i) - loop.resultTimesNanos.get(i - 1)) / 1e6 * timeScale;
                         if (ms >= 25) {
                             longIntervals++;
                             if (loop.resultRunNanos.get(i) / 1e6 * timeScale >= 3) {
@@ -2135,8 +2129,8 @@ public class MLTagEndToEndSimulation {
      * pipelines and captures released. A pipeline or a capture of a loop that did not stop is not
      * released, because its thread can still use it. That is an error.
      *
-     * @param primary The exception that stops the scenario, or null. An error of the cleanup is
-     *     added to it, so that the first cause stays visible.
+     * @param primary The exception that stops the scenario, or null. An error of the cleanup is added
+     *     to it, so that the first cause stays visible.
      */
     private static void restoreAfterScenario(
             List<CameraLoop> loops,
@@ -2341,7 +2335,8 @@ public class MLTagEndToEndSimulation {
             if (appCpuSetting != null && !appCpuSetting.isBlank()) {
                 long mask = 0;
                 for (int cpu : intList("PV_MLTAG_SIM_APP_CPUS", new int[0])) {
-                    assertTrue(cpu >= 0 && cpu <= 63, "PV_MLTAG_SIM_APP_CPUS: CPU " + cpu + " is not 0 to 63");
+                    assertTrue(
+                            cpu >= 0 && cpu <= 63, "PV_MLTAG_SIM_APP_CPUS: CPU " + cpu + " is not 0 to 63");
                     mask |= 1L << cpu;
                 }
                 assertTrue(GStreamerCaptureJNI.setCurrentThreadCpuMask(mask), "Could not set the CPU mask");
@@ -2354,8 +2349,7 @@ public class MLTagEndToEndSimulation {
                 line(
                         "The JVM can use %d CPUs, the board has %d. The results are NOT VALID for the"
                                 + " board.",
-                        hostCpus,
-                        board.cpus());
+                        hostCpus, board.cpus());
             } else {
                 throw new AssertionError(
                         "The simulation models a board with "
@@ -2503,7 +2497,8 @@ public class MLTagEndToEndSimulation {
         return reference;
     }
 
-    private static List<double[]> changed(List<List<double[]>> reference, int value, double newValue) {
+    private static List<double[]> changed(
+            List<List<double[]>> reference, int value, double newValue) {
         double[] copy = reference.get(0).get(0).clone();
         copy[value] = newValue;
         return List.of(copy);
@@ -2589,9 +2584,8 @@ public class MLTagEndToEndSimulation {
     }
 
     /**
-     * Proof that the capture time check works: with the input frame time on each result, the
-     * results of the overlap mode (a result for an older frame) must give errors. Needs
-     * PV_MLTAG_SIM=1.
+     * Proof that the capture time check works: with the input frame time on each result, the results
+     * of the overlap mode (a result for an older frame) must give errors. Needs PV_MLTAG_SIM=1.
      */
     @Test
     public void inputFrameTimeOnTheResultIsFound() throws Exception {
@@ -2604,9 +2598,7 @@ public class MLTagEndToEndSimulation {
         Outcome outcome = runScenario(ORANGE_PI, 1, 1.0, sleepMicros, 0, InputFrameTimePipeline::new);
         line(
                 "input frame time proof: orderAndTimeErrors=%d of %d results, first: %s",
-                outcome.orderAndTimeErrors(),
-                outcome.checkedResults(),
-                outcome.firstOrderAndTimeError());
+                outcome.orderAndTimeErrors(), outcome.checkedResults(), outcome.firstOrderAndTimeError());
         assertTrue(outcome.orderAndTimeErrors() > 0, "The wrong capture time was not found");
         assertTrue(
                 outcome.firstOrderAndTimeError().contains("is not the time of the result frame"),
