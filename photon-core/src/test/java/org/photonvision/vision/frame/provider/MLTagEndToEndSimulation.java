@@ -160,6 +160,10 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * and JPEG factor 2.1; the runs used k = 1.7, 2.0 and 2.6. The JPEG decode is slower on the RK3588
  * than the general factor shows.
  *
+ * <p>PV_MLTAG_SIM_LANES (1 to 4) replaces the lane count of the board profile for all scenarios
+ * of the run, as PV_MLTAG_SIM_INFERENCE_MS replaces the inference time. It lets you measure other
+ * values of PV_MLTAG_INFERENCE_LANES without a code change.
+ *
  * <p>The run scripts set PV_OPENCV_THREADS=1 and PV_GSTREAMER_CAPTURE_RT_PRIORITY=10. Use the same
  * settings for the simulation. The real-time priority needs root or CAP_SYS_NICE. If the kernel
  * refuses it, the simulation fails.
@@ -2271,7 +2275,7 @@ public class MLTagEndToEndSimulation {
                         : "";
         String notValid = cpuCountNotValid ? " | NOT VALID FOR THE BOARD: " + hostCpus + " CPUs" : "";
         line(
-                "%-11s cameras=%d cpuSlowdown=%.1f%s npuMs=%.1f | cameraFps=%.1f resultFps=%s"
+                "%-11s cameras=%d cpuSlowdown=%.1f%s npuMs=%.1f lanes=%d | cameraFps=%.1f resultFps=%s"
                         + "p99FrameFps=%sp99ReportedFps=%sworstSecondFps=%s| latencyMs p50=%.1f p95=%.1f max=%.1f | decodeMs=%.1f getMs=%.1f runMs=%.1f"
                         + " pipesMs=%.1f | equalToReference=%.2f%% (%d results from the first one)"
                         + " orderAndTimeErrors=%d | poseIterations=%d, pose compared | groups=%d"
@@ -2281,6 +2285,7 @@ public class MLTagEndToEndSimulation {
                 slowdown,
                 jpeg,
                 board.inferenceMillis(),
+                board.lanes(),
                 o.cameraFps(),
                 fps.toString(),
                 p99.toString(),
@@ -2399,8 +2404,34 @@ public class MLTagEndToEndSimulation {
         prepareScene();
     }
 
+    /**
+     * Reads PV_MLTAG_SIM_LANES. It replaces the lane count of the board profile, so a run can
+     * measure other lane counts without a code change.
+     *
+     * @return The lane count of the setting, or the lane count of the board if it is not set.
+     */
+    private static int simulatedLanes(Board board) {
+        String raw = System.getenv("PV_MLTAG_SIM_LANES");
+        if (raw == null || raw.isBlank()) {
+            return board.lanes();
+        }
+        int lanes;
+        try {
+            lanes = Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            lanes = 0;
+        }
+        // A wrong value must stop the run, because otherwise the report shows a lane count that the
+        // operator did not ask for.
+        assertTrue(
+                lanes >= 1 && lanes <= 4,
+                "PV_MLTAG_SIM_LANES must be an integer from 1 to 4, not \"" + raw + "\"");
+        return lanes;
+    }
+
     private static void runBoard(Board defaultBoard) throws Exception {
         prepareSimulation(defaultBoard);
+        int lanes = simulatedLanes(defaultBoard);
         line(
                 "mode: %s. Camera format: %s. ATR (adaptive tag resizing): %s. CPU time of the NPU"
                         + " library: %.1f ms for each inference.",
@@ -2414,7 +2445,7 @@ public class MLTagEndToEndSimulation {
                 "settings: hostCpus=%d appCpus=%d boardCpus=%d VisionWorkerPool.THREADS=%d"
                         + " PV_OPENCV_THREADS=%s (OpenCV threads %d) PV_GSTREAMER_CAPTURE_RT_PRIORITY=%s"
                         + " PV_GSTREAMER_CAPTURE_JPEG_IDCT=%s PV_GSTREAMER_CAPTURE_DECODE_CPUS=%s"
-                        + " PV_MLTAG_SIM_APP_CPUS=%s cameraFormat=%s",
+                        + " PV_MLTAG_SIM_APP_CPUS=%s PV_MLTAG_SIM_LANES=%s cameraFormat=%s",
                 hostCpus,
                 appCpus,
                 defaultBoard.cpus(),
@@ -2425,6 +2456,7 @@ public class MLTagEndToEndSimulation {
                 setting("PV_GSTREAMER_CAPTURE_JPEG_IDCT"),
                 setting("PV_GSTREAMER_CAPTURE_DECODE_CPUS"),
                 setting("PV_MLTAG_SIM_APP_CPUS"),
+                setting("PV_MLTAG_SIM_LANES"),
                 CAMERA_FORMAT);
 
         // PV_MLTAG_SIM_INFERENCE_MS is a list of mean inference times that replace the time of the
@@ -2450,7 +2482,7 @@ public class MLTagEndToEndSimulation {
                                 defaultBoard.npuCores(),
                                 inferenceMillis,
                                 defaultBoard.inferenceSpread(),
-                                defaultBoard.lanes(),
+                                lanes,
                                 defaultBoard.cpus());
                 for (int cameras : intList("PV_MLTAG_SIM_CAMERAS", new int[] {1, 2})) {
                     Outcome outcome =
