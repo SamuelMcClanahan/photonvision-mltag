@@ -55,7 +55,8 @@ public class GStreamerUSBFrameProviderTest {
         assumeTrue(GStreamerCapture.isAvailable(), "Native GStreamer capture library is not loaded");
         for (String element : elements) {
             assumeTrue(
-                    GStreamerCaptureJNI.hasElement(element), "GStreamer element is not installed: " + element);
+                    GStreamerCaptureJNI.hasElement(element),
+                    "GStreamer element is not installed: " + element);
         }
     }
 
@@ -176,8 +177,7 @@ public class GStreamerUSBFrameProviderTest {
         var silent =
                 new TestProvider(
                         "Silent", "appsrc is-live=true ! " + CAPS + " ! " + APPSINK + " async=false");
-        var good =
-                new TestProvider("Good", "videotestsrc is-live=true ! " + CAPS + " ! " + APPSINK);
+        var good = new TestProvider("Good", "videotestsrc is-live=true ! " + CAPS + " ! " + APPSINK);
 
         Thread silentThread = new Thread(() -> hasImage(silent.get()));
         silentThread.start();
@@ -206,8 +206,7 @@ public class GStreamerUSBFrameProviderTest {
         assumeElements("videotestsrc");
         var provider =
                 new TestProvider(
-                        "Ending",
-                        "videotestsrc is-live=true num-buffers=15 ! " + CAPS + " ! " + APPSINK);
+                        "Ending", "videotestsrc is-live=true num-buffers=15 ! " + CAPS + " ! " + APPSINK);
         try {
             // Read frames until the stream ends.
             int frames = 0;

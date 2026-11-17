@@ -131,8 +131,7 @@ public class CpuImageProcessorTest {
 
         Frame frame = processor.get();
         // No stream draws on the frame, so the processed image is the input image with no copy.
-        assertEquals(
-                frame.colorImage.getMat().dataAddr(), frame.processedImage.getMat().dataAddr());
+        assertEquals(frame.colorImage.getMat().dataAddr(), frame.processedImage.getMat().dataAddr());
         assertSameBytes(picture, frame.processedImage.getMat());
 
         frame.release();

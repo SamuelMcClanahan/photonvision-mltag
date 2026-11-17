@@ -225,15 +225,14 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
     }
 
     /**
-     * Creates the native pipeline. The global lock covers only the native create call. The cameras
-     * do not open at the same time, but a camera that gives no frame does not stop the open of the
-     * other cameras.
+     * Creates the native pipeline. The global lock covers only the native create call. The cameras do
+     * not open at the same time, but a camera that gives no frame does not stop the open of the other
+     * cameras.
      */
     private static GStreamerCapture openNative(PipelineCandidate candidate) {
         synchronized (CAPTURE_OPEN_LOCK) {
             staggerOpenIfRequested();
-            GStreamerCapture opened =
-                    GStreamerCapture.open(candidate.pipeline(), candidate.outputMode());
+            GStreamerCapture opened = GStreamerCapture.open(candidate.pipeline(), candidate.outputMode());
             if (opened != null) {
                 lastOpenCompleteMillis = System.currentTimeMillis();
             }

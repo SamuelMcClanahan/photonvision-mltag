@@ -83,10 +83,14 @@ public class GStreamerRunScriptsTest {
     private Map<String, String> baseEnv(String name, Path library) throws IOException {
         Path home = Files.createDirectories(tempDir.resolve("home"));
         return Map.of(
-                homeVariable(name), home.toString(),
-                "PV_GSTREAMER_CAPTURE_JNI_LIB", library.toString(),
-                "PV_PHOTONVISION_JAR", tempDir.resolve("dummy.jar").toString(),
-                "PATH", stubJavaDir() + ":" + System.getenv("PATH"));
+                homeVariable(name),
+                home.toString(),
+                "PV_GSTREAMER_CAPTURE_JNI_LIB",
+                library.toString(),
+                "PV_PHOTONVISION_JAR",
+                tempDir.resolve("dummy.jar").toString(),
+                "PATH",
+                stubJavaDir() + ":" + System.getenv("PATH"));
     }
 
     @ParameterizedTest
@@ -95,9 +99,7 @@ public class GStreamerRunScriptsTest {
         Path missing = tempDir.resolve("no-such-library.so");
         var result = run(name, baseEnv(name, missing), List.of());
         assertEquals(1, result.exitCode(), result.output());
-        assertTrue(
-                result.output().contains("Capture library not found: " + missing),
-                result.output());
+        assertTrue(result.output().contains("Capture library not found: " + missing), result.output());
         assertFalse(result.output().contains("STUB_JAVA_STARTED"), result.output());
     }
 
@@ -119,16 +121,19 @@ public class GStreamerRunScriptsTest {
         Path home = Files.createDirectories(tempDir.resolve("home"));
         var env =
                 Map.of(
-                        homeVariable(name), home.toString(),
-                        "PV_PHOTONVISION_JAR", tempDir.resolve("dummy.jar").toString(),
-                        "PATH", stubJavaDir() + ":" + System.getenv("PATH"));
+                        homeVariable(name),
+                        home.toString(),
+                        "PV_PHOTONVISION_JAR",
+                        tempDir.resolve("dummy.jar").toString(),
+                        "PATH",
+                        stubJavaDir() + ":" + System.getenv("PATH"));
         var result = run(name, env, List.of("HOME", "PV_GSTREAMER_CAPTURE_JNI_LIB"));
         assertFalse(result.output().contains("unbound variable"), result.output());
         if (result.exitCode() != 0) {
             assertTrue(
-                    result.output()
-                            .contains(
-                                    "Capture library not found: /root/pv-gstreamer-capture-jni/build/"),
+                    result
+                            .output()
+                            .contains("Capture library not found: /root/pv-gstreamer-capture-jni/build/"),
                     result.output());
         }
     }

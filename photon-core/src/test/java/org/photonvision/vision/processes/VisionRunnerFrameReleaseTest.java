@@ -67,8 +67,7 @@ public class VisionRunnerFrameReleaseTest {
                 Thread.currentThread().interrupt();
             }
             framesGiven.incrementAndGet();
-            CVMat color =
-                    new CVMat(new Mat(4, 4, CvType.CV_8UC1), imagesReleased::incrementAndGet, true);
+            CVMat color = new CVMat(new Mat(4, 4, CvType.CV_8UC1), imagesReleased::incrementAndGet, true);
             CVMat processed =
                     new CVMat(new Mat(4, 4, CvType.CV_8UC1), imagesReleased::incrementAndGet, true);
             return new Frame(
@@ -239,8 +238,7 @@ public class VisionRunnerFrameReleaseTest {
         // The first call of each loop gives P1 and the second call gives P2, as if the robot code
         // changed the pipeline while the vision thread waited for the frame.
         AtomicInteger calls = new AtomicInteger();
-        Supplier<CVPipeline> pipelineSupplier =
-                () -> calls.getAndIncrement() % 2 == 0 ? p1 : p2;
+        Supplier<CVPipeline> pipelineSupplier = () -> calls.getAndIncrement() % 2 == 0 ? p1 : p2;
 
         var runner =
                 new VisionRunner(
