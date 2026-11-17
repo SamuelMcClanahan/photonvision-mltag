@@ -93,6 +93,12 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * <p>What is real: the MJPEG frames, the native capture library and its JPEG decode thread, the
  * model input preparation, the AprilTag pipeline (ROI decode, pose estimation), and all threads.
  *
+ * <p>PV_MLTAG_SIM_CAMERA_FORMAT selects the format of the simulated camera. "mjpeg" (default) is
+ * Motion-JPEG. "gray" is the uncompressed 8-bit gray mode (V4L2 GREY) of the ThriftyCam with
+ * firmware 5.10 or newer. In the gray mode each frame is a raw file of 1600x1304 bytes, the capture
+ * library gets GRAY8 buffers, and there is no JPEG decode. The frame set then needs about 750 MB of
+ * disk for 360 frames.
+ *
  * <p>What is simulated: the camera (a paced file source) and the NPU (a wait of the measured
  * inference time, limited to the number of NPU cores of the board).
  *
@@ -127,6 +133,14 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * the computer where this simulation was made, so 1.3 is the expected value, and 1.5 and 2.0 are
  * values with a reserve. Measure the ratio again on a different computer.
  *
+ * <p>The JPEG decode is slower on the RK3588 than this general ratio. The benchmark pts/tjbench of
+ * the Phoronix Test Suite (libjpeg-turbo, picture jpeg-test-1.JPG, 4:2:2 to BGR) gives 156
+ * megapixels per second on the computer where this simulation was made. It gives 97.4 megapixels
+ * per second on the Cortex-A76 of the RK3588 (openbenchmarking.org result for a Mixtile Blade 3).
+ * So the JPEG decode is 1.6 times slower on the RK3588. PV_MLTAG_SIM_JPEG_FACTOR sets this factor
+ * for the JPEG decode in the work mode with the mjpeg format. Without it, the JPEG decode uses the
+ * value of k. The time scaling mode does not use it, because there all work has the same factor k.
+ *
  * <p>The run scripts set PV_OPENCV_THREADS=1 and PV_GSTREAMER_CAPTURE_RT_PRIORITY=10. Use the same
  * settings for the simulation. The real-time priority needs root or CAP_SYS_NICE.
  *
@@ -156,6 +170,47 @@ public class MLTagEndToEndSimulation {
 
     /** PV_MLTAG_SIM_NULL=1: the vision loops take the frames and do no work (reference). */
     private static final boolean NULL_PIPELINE = "1".equals(System.getenv("PV_MLTAG_SIM_NULL"));
+
+    /**
+     * PV_MLTAG_SIM_CAMERA_FORMAT: "mjpeg" (default) or "gray". The gray mode simulates the
+     * uncompressed GRAY8 mode of the camera, where the coprocessor does no JPEG decode.
+     */
+    private static final String CAMERA_FORMAT = cameraFormat();
+
+    private static final boolean GRAY_CAMERA = "gray".equals(CAMERA_FORMAT);
+
+    private static String cameraFormat() {
+        String raw = System.getenv("PV_MLTAG_SIM_CAMERA_FORMAT");
+        return raw == null || raw.isBlank() ? "mjpeg" : raw.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * PV_MLTAG_SIM_JPEG_FACTOR: the CPU factor of the JPEG decode in the work mode, or null if the
+     * setting is absent. It is separate from k because the JPEG decode of the RK3588 is slower than
+     * its general CPU speed (see the class comment). The time scaling mode does not use it.
+     */
+    private static final Double JPEG_FACTOR = jpegFactorSetting();
+
+    private static Double jpegFactorSetting() {
+        String raw = System.getenv("PV_MLTAG_SIM_JPEG_FACTOR");
+        return raw == null || raw.isBlank() ? null : Double.parseDouble(raw.trim());
+    }
+
+    /** The factor of the JPEG decode work for a scenario with the general CPU factor k. */
+    private static double jpegFactor(double slowdown) {
+        return JPEG_FACTOR != null ? JPEG_FACTOR : slowdown;
+    }
+
+    /**
+     * The extra JPEG decode work in percent for a scenario. Only the work mode with the mjpeg format
+     * adds work. In the gray mode there is no JPEG decode, so the value is 0.
+     */
+    private static int extraDecodePercent(double slowdown) {
+        if (!WORK_MODE || GRAY_CAMERA) {
+            return 0;
+        }
+        return (int) Math.round((jpegFactor(slowdown) - 1.0) * 100);
+    }
 
     @TempDir static Path tempDir;
 
@@ -217,10 +272,10 @@ public class MLTagEndToEndSimulation {
      * What the simulation knows about one camera frame.
      *
      * @param source Index into {@link #sourceNames}.
-     * @param jpegBytes Size of the Motion-JPEG frame.
+     * @param frameBytes Size of the frame file in the active camera format.
      * @param boxes The regions that the simulated model gives for this frame.
      */
-    private record SceneFrame(int source, long jpegBytes, List<RotatedRect> boxes) {}
+    private record SceneFrame(int source, long frameBytes, List<RotatedRect> boxes) {}
 
     private static SceneFrame[] sceneFrames;
     private static List<String> sourceNames;
@@ -657,8 +712,29 @@ public class MLTagEndToEndSimulation {
         }
     }
 
+    /**
+     * Writes a frame as the gray mode of the camera sends it: the 8-bit picture, row after row, with
+     * no header and no padding. 1600 is a multiple of 4, so the row stride of GRAY8 in GStreamer is
+     * the width and the file has exactly the size of one buffer. Returns the size of the frame.
+     */
+    private static long writeGray(Mat scene, Path file) throws java.io.IOException {
+        assertEquals(CvType.CV_8UC1, scene.type());
+        assertEquals(WIDTH, scene.cols());
+        assertEquals(HEIGHT, scene.rows());
+        byte[] bytes = new byte[WIDTH * HEIGHT];
+        // get() copies row after row, also when the Mat is not continuous.
+        scene.get(0, 0, bytes);
+        java.nio.file.Files.write(file, bytes);
+        return bytes.length;
+    }
+
+    /** The file name pattern of the frames, for the active camera format. */
+    private static String framePattern() {
+        return GRAY_CAMERA ? "frame_%04d.gray" : "frame_%04d.jpg";
+    }
+
     private static Path framePath(int index) {
-        return frameDirectory.resolve(String.format(Locale.ROOT, "frame_%04d.jpg", index));
+        return frameDirectory.resolve(String.format(Locale.ROOT, framePattern(), index));
     }
 
     /** For each source in sequence: the number of regions without a tag that the model gives. */
@@ -741,7 +817,8 @@ public class MLTagEndToEndSimulation {
 
             applyLighting(scene, lighting, gradientMap, 0.03 * Math.sin(driftPhase + i * 0.6));
             drawFrameIndex(scene, index);
-            long bytes = writeJpeg(scene, framePath(index));
+            long bytes =
+                    GRAY_CAMERA ? writeGray(scene, framePath(index)) : writeJpeg(scene, framePath(index));
             frames.add(new SceneFrame(sourceIndex, bytes, boxes));
             scene.release();
         }
@@ -813,9 +890,9 @@ public class MLTagEndToEndSimulation {
         int sumTags = 0;
         for (int i = 0; i < sceneFrames.length; i++) {
             SceneFrame frame = sceneFrames[i];
-            minBytes = Math.min(minBytes, frame.jpegBytes());
-            maxBytes = Math.max(maxBytes, frame.jpegBytes());
-            sumBytes += frame.jpegBytes();
+            minBytes = Math.min(minBytes, frame.frameBytes());
+            maxBytes = Math.max(maxBytes, frame.frameBytes());
+            sumBytes += frame.frameBytes();
             minBoxes = Math.min(minBoxes, frame.boxes().size());
             maxBoxes = Math.max(maxBoxes, frame.boxes().size());
             sumBoxes += frame.boxes().size();
@@ -827,17 +904,19 @@ public class MLTagEndToEndSimulation {
         double count = sceneFrames.length;
         line(
                 "frame set: %d different frames from %d real pictures (%d frames for each picture),"
-                        + " %dx%d monochrome MJPEG 4:2:2. Made in %.0f s.",
+                        + " %dx%d %s. Made in %.0f s.",
                 sceneFrames.length,
                 names.size(),
                 framesForEachSource,
                 WIDTH,
                 HEIGHT,
+                GRAY_CAMERA ? "uncompressed 8-bit gray (GRAY8)" : "monochrome MJPEG 4:2:2",
                 (System.nanoTime() - start) / 1e9);
         line(
-                "frame set: JPEG size min/mean/max = %d/%.0f/%d kB | model regions for each frame"
-                        + " min/mean/max = %d/%.1f/%d | decoded tags for each frame min/mean/max ="
-                        + " %d/%.1f/%d",
+                "frame set: frame size (%s) min/mean/max = %d/%.0f/%d kB | model regions for each"
+                        + " frame min/mean/max = %d/%.1f/%d | decoded tags for each frame"
+                        + " min/mean/max = %d/%.1f/%d",
+                CAMERA_FORMAT,
                 minBytes / 1000,
                 sumBytes / count / 1000.0,
                 maxBytes / 1000,
@@ -858,11 +937,11 @@ public class MLTagEndToEndSimulation {
                         frameCount++;
                         boxes += sceneFrames[i].boxes().size();
                         tags += referenceTags.get(i).size();
-                        bytes += sceneFrames[i].jpegBytes();
+                        bytes += sceneFrames[i].frameBytes();
                     }
                 }
                 line(
-                        "  source %2d %-44s regions=%.1f (%s) decodedTags=%.1f jpegKb=%d",
+                        "  source %2d %-44s regions=%.1f (%s) decodedTags=%.1f frameKb=%d",
                         source,
                         names.get(source),
                         boxes / (double) frameCount,
@@ -934,7 +1013,7 @@ public class MLTagEndToEndSimulation {
     /**
      * Makes the reference data: a slow camera gives each frame, and a pipeline with one lane and no
      * NPU wait completes each frame before the next frame arrives. The frames go through the same
-     * capture library and the same JPEG decoder as in the load runs.
+     * capture library (and in the mjpeg format the same JPEG decoder) as in the load runs.
      */
     private static void prepareReference() throws Exception {
         List<List<double[]>> reference = new ArrayList<>();
@@ -1005,13 +1084,21 @@ public class MLTagEndToEndSimulation {
     private static String cameraPipeline(long sleepMicros, int firstFrame) {
         // identity waits between buffers, which makes a frame rate. The name pvcapturetime tells
         // the capture library that a frame "arrives" after this element.
+        // In the gray mode the caps tell GStreamer the raw format, because a raw file has no header.
+        // A real camera in this mode gives the same caps through v4l2src.
+        String caps =
+                GRAY_CAMERA
+                        ? "video/x-raw,format=GRAY8,width=" + WIDTH + ",height=" + HEIGHT + ",framerate=60/1"
+                        : "image/jpeg,framerate=60/1";
         return "multifilesrc location=\""
-                + frameDirectory.resolve("frame_%04d.jpg")
+                + frameDirectory.resolve(framePattern())
                 + "\" index="
                 + firstFrame
                 + " start-index=0 stop-index="
                 + (sceneFrames.length - 1)
-                + " loop=true caps=image/jpeg,framerate=60/1 ! identity name=pvcapturetime sleep-time="
+                + " loop=true caps="
+                + caps
+                + " ! identity name=pvcapturetime sleep-time="
                 + sleepMicros
                 + " ! appsink name=pvappsink emit-signals=false max-buffers=1 drop=true sync=false";
     }
@@ -1487,11 +1574,11 @@ public class MLTagEndToEndSimulation {
     private static Outcome runScenario(Board board, int cameras, double slowdown, long sleepMicros)
             throws Exception {
         // Time scaling: all times of this computer are 1 / slowdown of the coprocessor times.
-        // Work mode: real time, and the CPU stages do "slowdown" times their work.
+        // Work mode: real time, and the CPU stages do "slowdown" times their work. The JPEG decode
+        // uses its own factor (PV_MLTAG_SIM_JPEG_FACTOR), and the gray mode has no JPEG decode.
         final double timeScale = WORK_MODE ? 1.0 : slowdown;
         final double workMultiplier = WORK_MODE ? slowdown : 1.0;
-        GStreamerCaptureJNI.setTestExtraDecodePercent(
-                WORK_MODE ? (int) Math.round((slowdown - 1.0) * 100) : 0);
+        GStreamerCaptureJNI.setTestExtraDecodePercent(extraDecodePercent(slowdown));
         // The CPU part of the inference is CPU work: it does not get shorter with the time scale,
         // and it is multiplied in the work mode.
         SimulatedNpu npu =
@@ -1792,13 +1879,22 @@ public class MLTagEndToEndSimulation {
         for (double value : o.reportedFpsLow()) {
             reportedLow.append(String.format(Locale.ROOT, "%.1f ", value));
         }
+        // The JPEG factor has an effect only in the work mode with the mjpeg format.
+        String jpeg =
+                WORK_MODE && !GRAY_CAMERA
+                        ? " jpegFactor="
+                                + java.math.BigDecimal.valueOf(jpegFactor(slowdown))
+                                        .stripTrailingZeros()
+                                        .toPlainString()
+                        : "";
         line(
-                "%-11s cameras=%d cpuSlowdown=%.1f npuMs=%.1f | cameraFps=%.1f resultFps=%s"
+                "%-11s cameras=%d cpuSlowdown=%.1f%s npuMs=%.1f | cameraFps=%.1f resultFps=%s"
                         + "p99FrameFps=%sp99ReportedFps=%sworstSecondFps=%s| latencyMs p50=%.1f p95=%.1f max=%.1f | decodeMs=%.1f getMs=%.1f runMs=%.1f"
                         + " pipesMs=%.1f | equalToReference=%.2f%% | cpuCoresBusy=%.2f",
                 board.name(),
                 cameras,
                 slowdown,
+                jpeg,
                 board.inferenceMillis(),
                 o.cameraFps(),
                 fps.toString(),
@@ -1840,12 +1936,19 @@ public class MLTagEndToEndSimulation {
     private static void runBoard(Board defaultBoard) throws Exception {
         assumeTrue(enabled(), "Set PV_MLTAG_SIM=1 to run the simulation");
         assumeTrue(GStreamerCapture.isAvailable(), "Native GStreamer capture library is not loaded");
-        assumeTrue(GStreamerCaptureJNI.hasCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE));
+        assertTrue(
+                "mjpeg".equals(CAMERA_FORMAT) || GRAY_CAMERA,
+                "PV_MLTAG_SIM_CAMERA_FORMAT must be mjpeg or gray, not " + CAMERA_FORMAT);
+        // The gray mode does not use the JPEG decoder of the library.
+        if (!GRAY_CAMERA) {
+            assumeTrue(GStreamerCaptureJNI.hasCapability(GStreamerCaptureJNI.CAP_JPEG_DECODE));
+        }
         prepareScene();
         line(
-                "mode: %s. ATR (adaptive tag resizing): %s. CPU time of the NPU library: %.1f ms for"
-                        + " each inference. Computer: %d CPUs.",
+                "mode: %s. Camera format: %s. ATR (adaptive tag resizing): %s. CPU time of the NPU"
+                        + " library: %.1f ms for each inference. Computer: %d CPUs.",
                 WORK_MODE ? "real time with more CPU work" : "time scaling",
+                GRAY_CAMERA ? "gray (uncompressed GRAY8, no JPEG decode)" : "mjpeg",
                 ATR_ENABLED ? "on (pipeline default)" : "off",
                 NPU_CPU_MILLIS,
                 Runtime.getRuntime().availableProcessors());
