@@ -17,6 +17,9 @@
 
 package org.photonvision.gstreamer;
 
+import org.photonvision.common.logging.LogGroup;
+import org.photonvision.common.logging.Logger;
+
 /** JNI entrypoints for low-latency native GStreamer capture. */
 public final class GStreamerCaptureJNI {
     public static final String JNI_LIB_ENV = "PV_GSTREAMER_CAPTURE_JNI_LIB";
@@ -45,6 +48,11 @@ public final class GStreamerCaptureJNI {
     /** {@link #setCurrentThreadCpuMask(long)} is available. */
     public static final long CAP_THREAD_AFFINITY = 16;
 
+    private static final Logger logger = new Logger(GStreamerCaptureJNI.class, LogGroup.Camera);
+
+    // Set by load(). It must come before the fields that call load().
+    private static String loadError = null;
+
     private static final boolean loaded = load();
     private static final long capabilities = queryCapabilities();
 
@@ -60,8 +68,29 @@ public final class GStreamerCaptureJNI {
             }
             return true;
         } catch (UnsatisfiedLinkError | SecurityException e) {
+            // Keep the cause. Without it the camera only says that the open failed.
+            loadError = String.valueOf(e.getMessage());
+            logger.error(
+                    "Could not load the native GStreamer capture library ("
+                            + libraryDescription()
+                            + "): "
+                            + loadError);
             return false;
         }
+    }
+
+    /** Returns the path or name of the library that load() uses. */
+    public static String libraryDescription() {
+        String explicitPath = System.getenv(JNI_LIB_ENV);
+        if (explicitPath != null && !explicitPath.isBlank()) {
+            return JNI_LIB_ENV + "=" + explicitPath;
+        }
+        return "pv_gstreamer_capture_jni on java.library.path; set " + JNI_LIB_ENV;
+    }
+
+    /** Returns the message of the load error, or null if the library is loaded. */
+    public static String loadError() {
+        return loadError;
     }
 
     private static long queryCapabilities() {

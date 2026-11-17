@@ -14,9 +14,23 @@ set -euo pipefail
 #   cmake --build "$HOME/pv-gstreamer-capture-jni/build" -j4
 # The configure step must print "JPEG decode in the capture library: ON".
 
-cd "${PV_ORANGEPI_HOME:-$HOME/photonvision}"
+# A systemd service without User= has no HOME. Use /root then, because the
+# real-time priority below needs root. With sudo HOME is /root too.
+pv_user_home="${HOME:-/root}"
+pv_home="${PV_ORANGEPI_HOME:-$pv_user_home/photonvision}"
+if ! cd "$pv_home"; then
+    echo "Cannot enter the PhotonVision directory: $pv_home. Set PV_ORANGEPI_HOME." >&2
+    exit 1
+fi
 
-export PV_GSTREAMER_CAPTURE_JNI_LIB="${PV_GSTREAMER_CAPTURE_JNI_LIB:-$HOME/pv-gstreamer-capture-jni/build/libpv_gstreamer_capture_jni.so}"
+export PV_GSTREAMER_CAPTURE_JNI_LIB="${PV_GSTREAMER_CAPTURE_JNI_LIB:-$pv_user_home/pv-gstreamer-capture-jni/build/libpv_gstreamer_capture_jni.so}"
+
+# Stop here with a clear message. Without the library PhotonVision starts with
+# no camera and the log does not give the cause.
+if [[ ! -r "$PV_GSTREAMER_CAPTURE_JNI_LIB" ]]; then
+    echo "Capture library not found: $PV_GSTREAMER_CAPTURE_JNI_LIB. Build it (see the top of this script) or set PV_GSTREAMER_CAPTURE_JNI_LIB." >&2
+    exit 1
+fi
 export PV_GSTREAMER_CAPTURE_WRAP_BUFFER="${PV_GSTREAMER_CAPTURE_WRAP_BUFFER:-true}"
 export PV_USB_GSTREAMER_BACKEND="${PV_USB_GSTREAMER_BACKEND:-generic}"
 export PV_USB_GSTREAMER_JNI_CAPTURE="${PV_USB_GSTREAMER_JNI_CAPTURE:-true}"
@@ -123,6 +137,11 @@ fi
 # empty value to use all CPUs.
 cpu_affinity="${PV_CPU_AFFINITY-4-7}"
 if [[ -n "$cpu_affinity" ]] && command -v taskset >/dev/null 2>&1; then
-    exec taskset -c "$cpu_affinity" java -jar "$PV_PHOTONVISION_JAR"
+    # The kernel refuses a CPU list with CPUs that are not online or not in the
+    # cpuset of a container. Then start without the limit, not with no PhotonVision.
+    if taskset -c "$cpu_affinity" true >/dev/null 2>&1; then
+        exec taskset -c "$cpu_affinity" java -jar "$PV_PHOTONVISION_JAR"
+    fi
+    echo "Warning: taskset does not accept the CPU list '$cpu_affinity'. Starting java on all CPUs." >&2
 fi
 exec java -jar "$PV_PHOTONVISION_JAR"

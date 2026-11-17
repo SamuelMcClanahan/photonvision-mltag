@@ -317,6 +317,10 @@ public class VisionRunner {
                     logger.error("Exception on loop " + loopCount, ex);
                 }
                 loopCount++;
+            } else {
+                // The pipeline changed while we got the frame, so no pipeline uses it. Release it
+                // here, because it can hold a native camera buffer.
+                frame.release();
             }
         }
     }

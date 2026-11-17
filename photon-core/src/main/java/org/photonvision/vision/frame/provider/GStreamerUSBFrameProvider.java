@@ -52,12 +52,24 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
     private static final Object CAPTURE_OPEN_LOCK = new Object();
     private static long lastOpenCompleteMillis = 0;
 
+    /**
+     * A capture that gives no frame for this time is closed and opened again. A short USB disconnect
+     * ends the GStreamer stream, and without a reopen the camera stays lost until a restart. 0 = off.
+     */
+    private static final long STALL_REOPEN_NANOS =
+            EnvUtils.nonNegativeInteger("PV_USB_GSTREAMER_STALL_REOPEN_MS", 2000) * 1_000_000L;
+
+    /** A grab that returns faster than this did not wait for a frame (for example after EOS). */
+    private static final long FAST_EMPTY_GRAB_NANOS = 20_000_000L;
+
     private final Logger logger;
     private final VisionSourceSettables settables;
     private final Runnable connectedCallback;
     private GStreamerCapture capture = null;
     private boolean captureFailed = false;
     private long lastOpenFailureMillis = 0;
+    private long lastFrameNanos = 0;
+    private boolean libraryErrorLogged = false;
     private final MatPool colorMatPool = new MatPool();
     private volatile boolean monochromeAllowed = false;
 
@@ -82,10 +94,29 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
             return new CapturedFrame(new CVMat(), settables.getFrameStaticProperties(), 0);
         }
 
+        long grabStart = System.nanoTime();
         GStreamerFrame frame = capture.grab(250);
         if (frame == null) {
+            long now = System.nanoTime();
+            long stallNanos = stallReopenNanos();
+            if (stallNanos > 0 && now - lastFrameNanos >= stallNanos) {
+                // The camera stopped. Close the capture so that the normal open path with its
+                // cooldown opens the camera again.
+                logger.warn(
+                        "Native GStreamer USB capture gave no frame for "
+                                + (now - lastFrameNanos) / 1_000_000L
+                                + " ms; opening it again");
+                releaseCapture();
+                captureFailed = true;
+                lastOpenFailureMillis = System.currentTimeMillis();
+            } else if (now - grabStart < FAST_EMPTY_GRAB_NANOS) {
+                // The native side did not wait (the stream ended). Wait here so that the vision
+                // loop does not use a full CPU and make garbage for each empty frame.
+                sleepQuietly(FAST_EMPTY_GRAB_NANOS / 1_000_000L);
+            }
             return new CapturedFrame(new CVMat(), settables.getFrameStaticProperties(), 0);
         }
+        lastFrameNanos = System.nanoTime();
 
         FrameCaptureMetadata metadata =
                 frame.toCaptureMetadata(FrameCaptureMetadata.SOURCE_GSTREAMER_JNI, MathUtils.wpiNanoTime());
@@ -124,24 +155,29 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
             return true;
         }
 
-        synchronized (CAPTURE_OPEN_LOCK) {
-            staggerOpenIfRequested();
+        if (!nativeLibraryAvailable()) {
+            // Without the library no candidate can open. Say why one time, because the general
+            // open warnings do not give the cause.
+            if (!libraryErrorLogged) {
+                logger.error(
+                        "Native GStreamer capture library is not loaded ("
+                                + GStreamerCaptureJNI.libraryDescription()
+                                + "): "
+                                + java.util.Objects.requireNonNullElse(
+                                        GStreamerCaptureJNI.loadError(), "unknown load error"));
+                libraryErrorLogged = true;
+            }
+            captureFailed = true;
+            lastOpenFailureMillis = System.currentTimeMillis();
+            return false;
+        }
 
-            int openAttempts = EnvUtils.integer("PV_USB_GSTREAMER_OPEN_ATTEMPTS", 3);
-            for (int ioMode : getIoModeCandidates()) {
-                for (PipelineCandidate candidate : buildCandidates(ioMode)) {
-                    for (int attempt = 1; attempt <= openAttempts; attempt++) {
-                        if (openCandidate(candidate)) {
-                            logger.info(
-                                    "Opened native GStreamer USB capture ("
-                                            + candidate.description()
-                                            + "): "
-                                            + candidate.pipeline());
-                            captureFailed = false;
-                            lastOpenCompleteMillis = System.currentTimeMillis();
-                            return true;
-                        }
-
+        int openAttempts = EnvUtils.integer("PV_USB_GSTREAMER_OPEN_ATTEMPTS", 3);
+        for (int ioMode : ioModeCandidates()) {
+            for (PipelineCandidate candidate : pipelineCandidates(ioMode)) {
+                for (int attempt = 1; attempt <= openAttempts; attempt++) {
+                    capture = openNative(candidate);
+                    if (capture == null || !capture.isOpen()) {
                         releaseCapture();
                         if (attempt < openAttempts) {
                             logger.warn(
@@ -155,13 +191,30 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
                                             + openAttempts);
                             sleepQuietly(250L * attempt);
                         }
+                        continue;
                     }
-                    logger.warn(
-                            "Native GStreamer USB capture candidate gave no frame ("
-                                    + candidate.description()
-                                    + "): "
-                                    + candidate.pipeline());
+
+                    if (waitForFirstFrame()) {
+                        logger.info(
+                                "Opened native GStreamer USB capture ("
+                                        + candidate.description()
+                                        + "): "
+                                        + candidate.pipeline());
+                        captureFailed = false;
+                        lastFrameNanos = System.nanoTime();
+                        return true;
+                    }
+
+                    // The pipeline opened but gave no frame. The same pipeline gives no frame on a
+                    // second attempt either, so go to the next candidate.
+                    releaseCapture();
+                    break;
                 }
+                logger.warn(
+                        "Native GStreamer USB capture candidate gave no frame ("
+                                + candidate.description()
+                                + "): "
+                                + candidate.pipeline());
             }
         }
 
@@ -169,6 +222,23 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
         captureFailed = true;
         lastOpenFailureMillis = System.currentTimeMillis();
         return false;
+    }
+
+    /**
+     * Creates the native pipeline. The global lock covers only the native create call. The cameras
+     * do not open at the same time, but a camera that gives no frame does not stop the open of the
+     * other cameras.
+     */
+    private static GStreamerCapture openNative(PipelineCandidate candidate) {
+        synchronized (CAPTURE_OPEN_LOCK) {
+            staggerOpenIfRequested();
+            GStreamerCapture opened =
+                    GStreamerCapture.open(candidate.pipeline(), candidate.outputMode());
+            if (opened != null) {
+                lastOpenCompleteMillis = System.currentTimeMillis();
+            }
+            return opened;
+        }
     }
 
     private static void staggerOpenIfRequested() {
@@ -184,19 +254,15 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
     }
 
     /**
-     * Opens a candidate and makes sure that it gives a frame. A pipeline can reach the PLAYING state
-     * and then give no frame, or give a pixel format that the native library cannot use. The first
-     * frame is the only reliable proof.
+     * Makes sure that the open capture gives a frame. A pipeline can reach the PLAYING state and then
+     * give no frame, or give a pixel format that the native library cannot use. The first frame is
+     * the only reliable proof.
      */
-    private boolean openCandidate(PipelineCandidate candidate) {
-        capture = GStreamerCapture.open(candidate.pipeline(), candidate.outputMode());
-        if (capture == null || !capture.isOpen()) {
-            return false;
-        }
-
+    private boolean waitForFirstFrame() {
         long firstFrameTimeoutMs = EnvUtils.integer("PV_USB_GSTREAMER_FIRST_FRAME_TIMEOUT_MS", 2500);
         long deadline = System.currentTimeMillis() + firstFrameTimeoutMs;
         while (System.currentTimeMillis() < deadline) {
+            long grabStart = System.nanoTime();
             GStreamerFrame frame = capture.grab(250);
             if (frame != null) {
                 // The pipeline is good. This frame is only a test, so release it.
@@ -204,8 +270,37 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
                 mat.release();
                 return true;
             }
+            if (System.nanoTime() - grabStart < FAST_EMPTY_GRAB_NANOS) {
+                // The stream ended at once. Do not use a full CPU until the deadline.
+                sleepQuietly(FAST_EMPTY_GRAB_NANOS / 1_000_000L);
+            }
         }
         return false;
+    }
+
+    /** The io-modes to try. Tests override this. */
+    int[] ioModeCandidates() {
+        return getIoModeCandidates();
+    }
+
+    /** The pipelines to try for one io-mode, in order. Tests override this. */
+    List<PipelineCandidate> pipelineCandidates(int ioMode) {
+        return buildCandidates(ioMode);
+    }
+
+    /** True if the native capture library is loaded. Tests override this. */
+    boolean nativeLibraryAvailable() {
+        return GStreamerCapture.isAvailable();
+    }
+
+    /** The time with no frame after which the capture is opened again. Tests override this. */
+    long stallReopenNanos() {
+        return STALL_REOPEN_NANOS;
+    }
+
+    /** The wait after a failed open before the next open. Tests override this. */
+    long reopenCooldownMs() {
+        return EnvUtils.integer("PV_USB_GSTREAMER_REOPEN_COOLDOWN_MS", 5000);
     }
 
     private List<PipelineCandidate> buildCandidates(int ioMode) {
@@ -770,7 +865,6 @@ public class GStreamerUSBFrameProvider extends CpuImageProcessor {
     }
 
     private boolean shouldRetryOpen() {
-        long cooldownMs = EnvUtils.integer("PV_USB_GSTREAMER_REOPEN_COOLDOWN_MS", 5000);
-        return System.currentTimeMillis() - lastOpenFailureMillis >= cooldownMs;
+        return System.currentTimeMillis() - lastOpenFailureMillis >= reopenCooldownMs();
     }
 }

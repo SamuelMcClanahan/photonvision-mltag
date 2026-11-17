@@ -89,7 +89,9 @@ public abstract class CpuImageProcessor extends FrameProvider {
                 outputMat = m_outputMatPool.take();
                 m_hsvPipe.processInto(input.colorImage.getMat(), outputMat.getMat());
             } else if (m_processType == FrameThresholdType.GREYSCALE) {
-                if (input.colorImage.getMat().channels() == 1 && !m_copyInput) {
+                // The output stream draws on the processed image in place. Use the input image
+                // itself only when no stream needs the frame, so that the input image stays clean.
+                if (input.colorImage.getMat().channels() == 1 && !m_copyInput && !m_copyOutput) {
                     outputMat = new CVMat(input.colorImage.getMat(), null, false);
                 } else {
                     outputMat = m_outputMatPool.take();
