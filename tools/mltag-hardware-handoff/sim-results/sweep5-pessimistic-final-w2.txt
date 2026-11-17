@@ -1,0 +1,103 @@
+== W2 two cameras, gray, pessimistic inputs
+[sim] frame set: 360 different frames from 18 real pictures (20 frames for each picture), 1600x1304 uncompressed 8-bit gray (GRAY8). Made in 21 s.
+[sim] frame set: frame size (gray) min/mean/max = 2086/2086/2086 kB | model regions for each frame min/mean/max = 0/2.1/4 | decoded tags for each frame min/mean/max = 0/1.3/4
+[sim]   source  0 jetson-frame-captures/20260629-103655-cam2.mjpg regions=1.0 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source  1 jetson-frame-captures/20260629-103655-cam3.mjpg regions=0.0 (detector) decodedTags=0.0 frameKb=2086
+[sim]   source  2 2024/Amp_42in.jpg                            regions=2.0 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source  3 2024/Amp_85in.jpg                            regions=1.0 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source  4 2024/BackAmpZone_117in.jpg                   regions=4.0 (detector) decodedTags=2.0 frameKb=2086
+[sim]   source  5 2024/GeneralField1.jpg                       regions=1.0 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source  6 2024/GeneralField2.jpg                       regions=2.6 (detector) decodedTags=1.5 frameKb=2086
+[sim]   source  7 2024/GeneralField3.jpg                       regions=3.5 (detector) decodedTags=0.6 frameKb=2086
+[sim]   source  8 2024/GeneralField4.jpg                       regions=0.3 (detector) decodedTags=0.2 frameKb=2086
+[sim]   source  9 2024/GeneralField5.jpg                       regions=2.0 (detector) decodedTags=2.0 frameKb=2086
+[sim]   source 10 2024/Loading_83in.jpg                        regions=2.3 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source 11 2024/Podium_103in.jpg                        regions=2.0 (detector) decodedTags=2.0 frameKb=2086
+[sim]   source 12 2024/SpeakerCenter_143in.jpg                 regions=4.0 (detector) decodedTags=2.0 frameKb=2086
+[sim]   source 13 2024/SpeakerCenter_19in.jpg                  regions=1.3 (detector) decodedTags=1.1 frameKb=2086
+[sim]   source 14 2024/SpeakerCenter_63in.jpg                  regions=3.0 (detector) decodedTags=2.0 frameKb=2086
+[sim]   source 15 2024/StageLeft_51in.jpg                      regions=4.0 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source 16 2024/StageRight_51in.jpg                     regions=1.0 (detector) decodedTags=1.0 frameKb=2086
+[sim]   source 17 2026/BlueOutpostFuelSpread.jpg               regions=3.8 (detector) decodedTags=3.6 frameKb=2086
+[sim] mode: real time with more CPU work. Camera format: gray (uncompressed GRAY8, no JPEG decode). ATR (adaptive tag resizing): on (pipeline default). CPU time of the NPU library: 2.0 ms for each inference.
+[sim] settings: hostCpus=4 appCpus=4 boardCpus=4 VisionWorkerPool.THREADS=3 PV_OPENCV_THREADS=1 (OpenCV threads 1) PV_GSTREAMER_CAPTURE_RT_PRIORITY=10 PV_GSTREAMER_CAPTURE_JPEG_IDCT=(not set) PV_GSTREAMER_CAPTURE_DECODE_CPUS=(not set) PV_MLTAG_SIM_APP_CPUS=(not set) cameraFormat=gray
+[sim]   intervals <18ms:45.32% <20ms:9.82% <22ms:9.51% <25ms:12.40% <30ms:16.59% <40ms:6.09% <1000ms:0.27% | long: 603, result not ready: 603 | gc: 0 collections, 0 ms
+[sim]     source  0 jetson-frame-captures/20260629-103655-cam2.mjpg results=178 pipesMs=44.3 longTimes=28.65%
+[sim]     source  1 jetson-frame-captures/20260629-103655-cam3.mjpg results=164 pipesMs=37.4 longTimes=26.83%
+[sim]     source  2 2024/Amp_42in.jpg                            results=133 pipesMs=46.7 longTimes=31.58%
+[sim]     source  3 2024/Amp_85in.jpg                            results=140 pipesMs=44.7 longTimes=27.14%
+[sim]     source  4 2024/BackAmpZone_117in.jpg                   results=133 pipesMs=52.3 longTimes=18.80%
+[sim]     source  5 2024/GeneralField1.jpg                       results=144 pipesMs=38.9 longTimes=27.78%
+[sim]     source  6 2024/GeneralField2.jpg                       results=134 pipesMs=48.8 longTimes=22.39%
+[sim]     source  7 2024/GeneralField3.jpg                       results=130 pipesMs=52.5 longTimes=13.85%
+[sim]     source  8 2024/GeneralField4.jpg                       results=145 pipesMs=38.2 longTimes=34.48%
+[sim]     source  9 2024/GeneralField5.jpg                       results=137 pipesMs=44.0 longTimes=29.20%
+[sim]     source 10 2024/Loading_83in.jpg                        results=137 pipesMs=48.6 longTimes=19.71%
+[sim]     source 11 2024/Podium_103in.jpg                        results=141 pipesMs=47.6 longTimes=15.60%
+[sim]     source 12 2024/SpeakerCenter_143in.jpg                 results=135 pipesMs=50.9 longTimes=15.56%
+[sim]     source 13 2024/SpeakerCenter_19in.jpg                  results=138 pipesMs=44.8 longTimes=26.81%
+[sim]     source 14 2024/SpeakerCenter_63in.jpg                  results=134 pipesMs=52.8 longTimes=14.93%
+[sim]     source 15 2024/StageLeft_51in.jpg                      results=157 pipesMs=52.4 longTimes=8.28%
+[sim]     source 16 2024/StageRight_51in.jpg                     results=179 pipesMs=42.4 longTimes=26.26%
+[sim]     source 17 2026/BlueOutpostFuelSpread.jpg               results=169 pipesMs=48.3 longTimes=22.49%
+[sim] Orange Pi 5 cameras=2 cpuSlowdown=2.6 npuMs=27.6 | cameraFps=61.1 resultFps=52.6 52.6 p99FrameFps=29.3 29.1 p99ReportedFps=51.0 51.0 worstSecondFps=49 49 | latencyMs p50=62.6 p95=77.2 max=136.2 | decodeMs=0.2 getMs=0.9 runMs=18.1 pipesMs=46.2 | equalToReference=100.00% (3124 results from the first one) orderAndTimeErrors=0 | poseIterations=104, pose compared | groups=1 rtThreads=2 | cpuCoresBusy=1.99 | modelInput=monochrome base operation
+[sim]   intervals <18ms:41.36% <20ms:10.30% <22ms:8.98% <25ms:11.74% <30ms:18.20% <40ms:9.10% <1000ms:0.32% | long: 692, result not ready: 692 | gc: 0 collections, 0 ms
+[sim]     source  0 jetson-frame-captures/20260629-103655-cam2.mjpg results=164 pipesMs=46.7 longTimes=32.32%
+[sim]     source  1 jetson-frame-captures/20260629-103655-cam3.mjpg results=154 pipesMs=39.6 longTimes=29.87%
+[sim]     source  2 2024/Amp_42in.jpg                            results=127 pipesMs=49.9 longTimes=30.71%
+[sim]     source  3 2024/Amp_85in.jpg                            results=130 pipesMs=46.7 longTimes=32.31%
+[sim]     source  4 2024/BackAmpZone_117in.jpg                   results=131 pipesMs=53.2 longTimes=21.37%
+[sim]     source  5 2024/GeneralField1.jpg                       results=135 pipesMs=41.4 longTimes=35.56%
+[sim]     source  6 2024/GeneralField2.jpg                       results=129 pipesMs=50.0 longTimes=26.36%
+[sim]     source  7 2024/GeneralField3.jpg                       results=127 pipesMs=53.4 longTimes=18.11%
+[sim]     source  8 2024/GeneralField4.jpg                       results=139 pipesMs=40.3 longTimes=23.74%
+[sim]     source  9 2024/GeneralField5.jpg                       results=129 pipesMs=44.9 longTimes=36.43%
+[sim]     source 10 2024/Loading_83in.jpg                        results=129 pipesMs=50.2 longTimes=34.88%
+[sim]     source 11 2024/Podium_103in.jpg                        results=130 pipesMs=50.2 longTimes=30.00%
+[sim]     source 12 2024/SpeakerCenter_143in.jpg                 results=134 pipesMs=52.4 longTimes=17.91%
+[sim]     source 13 2024/SpeakerCenter_19in.jpg                  results=130 pipesMs=47.7 longTimes=36.15%
+[sim]     source 14 2024/SpeakerCenter_63in.jpg                  results=129 pipesMs=54.5 longTimes=15.50%
+[sim]     source 15 2024/StageLeft_51in.jpg                      results=154 pipesMs=54.3 longTimes=14.94%
+[sim]     source 16 2024/StageRight_51in.jpg                     results=169 pipesMs=44.0 longTimes=34.32%
+[sim]     source 17 2026/BlueOutpostFuelSpread.jpg               results=165 pipesMs=50.2 longTimes=26.06%
+[sim] Orange Pi 5 cameras=2 cpuSlowdown=2.6 npuMs=29.2 | cameraFps=61.1 resultFps=50.2 50.1 p99FrameFps=26.8 27.2 p99ReportedFps=50.0 50.0 worstSecondFps=47 48 | latencyMs p50=66.1 p95=80.9 max=114.1 | decodeMs=0.3 getMs=0.8 runMs=19.1 pipesMs=48.2 | equalToReference=100.00% (2986 results from the first one) orderAndTimeErrors=0 | poseIterations=104, pose compared | groups=1 rtThreads=2 | cpuCoresBusy=1.87 | modelInput=monochrome base operation
+[sim]   intervals <18ms:36.43% <20ms:13.18% <22ms:15.62% <25ms:17.03% <30ms:12.43% <40ms:5.04% <1000ms:0.28% | long: 451, result not ready: 451 | gc: 0 collections, 0 ms
+[sim]     source  0 jetson-frame-captures/20260629-103655-cam2.mjpg results=144 pipesMs=47.2 longTimes=29.17%
+[sim]     source  1 jetson-frame-captures/20260629-103655-cam3.mjpg results=146 pipesMs=37.3 longTimes=19.18%
+[sim]     source  2 2024/Amp_42in.jpg                            results=136 pipesMs=50.0 longTimes=18.38%
+[sim]     source  3 2024/Amp_85in.jpg                            results=140 pipesMs=47.3 longTimes=16.43%
+[sim]     source  4 2024/BackAmpZone_117in.jpg                   results=131 pipesMs=54.3 longTimes=10.69%
+[sim]     source  5 2024/GeneralField1.jpg                       results=147 pipesMs=39.8 longTimes=17.69%
+[sim]     source  6 2024/GeneralField2.jpg                       results=136 pipesMs=50.3 longTimes=16.91%
+[sim]     source  7 2024/GeneralField3.jpg                       results=122 pipesMs=55.5 longTimes=19.67%
+[sim]     source  8 2024/GeneralField4.jpg                       results=140 pipesMs=38.3 longTimes=24.29%
+[sim]     source  9 2024/GeneralField5.jpg                       results=142 pipesMs=45.4 longTimes=26.76%
+[sim]     source 10 2024/Loading_83in.jpg                        results=128 pipesMs=52.8 longTimes=21.88%
+[sim]     source 11 2024/Podium_103in.jpg                        results=137 pipesMs=51.7 longTimes=13.87%
+[sim]     source 12 2024/SpeakerCenter_143in.jpg                 results=135 pipesMs=54.3 longTimes=8.89%
+[sim]     source 13 2024/SpeakerCenter_19in.jpg                  results=140 pipesMs=47.7 longTimes=20.71%
+[sim]     source 14 2024/SpeakerCenter_63in.jpg                  results=119 pipesMs=57.2 longTimes=19.33%
+[sim]     source 15 2024/StageLeft_51in.jpg                      results=151 pipesMs=56.2 longTimes=3.31%
+[sim]     source 16 2024/StageRight_51in.jpg                     results=178 pipesMs=43.7 longTimes=19.10%
+[sim]     source 17 2026/BlueOutpostFuelSpread.jpg               results=170 pipesMs=52.2 longTimes=14.12%
+[sim] Orange Pi 5 cameras=2 cpuSlowdown=3.4 npuMs=27.6 | cameraFps=60.2 resultFps=50.8 51.0 p99FrameFps=28.7 28.9 p99ReportedFps=44.0 43.0 worstSecondFps=46 47 | latencyMs p50=65.4 p95=80.8 max=104.4 | decodeMs=0.3 getMs=0.9 runMs=18.7 pipesMs=48.7 | equalToReference=100.00% (3025 results from the first one) orderAndTimeErrors=0 | poseIterations=136, pose compared | groups=1 rtThreads=2 | cpuCoresBusy=2.45 | modelInput=monochrome base operation
+[sim]   intervals <18ms:32.63% <20ms:12.43% <22ms:13.96% <25ms:16.89% <30ms:15.94% <40ms:7.64% <1000ms:0.50% | long: 583, result not ready: 583 | gc: 0 collections, 0 ms
+[sim]     source  0 jetson-frame-captures/20260629-103655-cam2.mjpg results=135 pipesMs=49.5 longTimes=30.37%
+[sim]     source  1 jetson-frame-captures/20260629-103655-cam3.mjpg results=136 pipesMs=40.3 longTimes=35.29%
+[sim]     source  2 2024/Amp_42in.jpg                            results=130 pipesMs=52.2 longTimes=20.77%
+[sim]     source  3 2024/Amp_85in.jpg                            results=133 pipesMs=50.3 longTimes=21.05%
+[sim]     source  4 2024/BackAmpZone_117in.jpg                   results=125 pipesMs=57.5 longTimes=16.00%
+[sim]     source  5 2024/GeneralField1.jpg                       results=138 pipesMs=41.2 longTimes=20.29%
+[sim]     source  6 2024/GeneralField2.jpg                       results=132 pipesMs=52.4 longTimes=18.18%
+[sim]     source  7 2024/GeneralField3.jpg                       results=121 pipesMs=58.8 longTimes=17.36%
+[sim]     source  8 2024/GeneralField4.jpg                       results=136 pipesMs=41.1 longTimes=32.35%
+[sim]     source  9 2024/GeneralField5.jpg                       results=136 pipesMs=47.2 longTimes=34.56%
+[sim]     source 10 2024/Loading_83in.jpg                        results=123 pipesMs=56.0 longTimes=29.27%
+[sim]     source 11 2024/Podium_103in.jpg                        results=131 pipesMs=53.5 longTimes=16.79%
+[sim]     source 12 2024/SpeakerCenter_143in.jpg                 results=127 pipesMs=57.1 longTimes=15.75%
+[sim]     source 13 2024/SpeakerCenter_19in.jpg                  results=131 pipesMs=49.6 longTimes=24.43%
+[sim]     source 14 2024/SpeakerCenter_63in.jpg                  results=117 pipesMs=59.4 longTimes=24.79%
+[sim]     source 15 2024/StageLeft_51in.jpg                      results=148 pipesMs=59.4 longTimes=17.57%
+[sim]     source 16 2024/StageRight_51in.jpg                     results=168 pipesMs=45.9 longTimes=26.19%
+[sim]     source 17 2026/BlueOutpostFuelSpread.jpg               results=154 pipesMs=54.2 longTimes=29.87%
+[sim] Orange Pi 5 cameras=2 cpuSlowdown=3.4 npuMs=29.2 | cameraFps=60.0 resultFps=48.3 48.6 p99FrameFps=26.1 27.8 p99ReportedFps=42.0 43.0 worstSecondFps=43 43 | latencyMs p50=69.2 p95=85.0 max=120.2 | decodeMs=0.3 getMs=0.7 runMs=19.9 pipesMs=51.2 | equalToReference=100.00% (2887 results from the first one) orderAndTimeErrors=0 | poseIterations=136, pose compared | groups=1 rtThreads=2 | cpuCoresBusy=2.38 | modelInput=monochrome base operation
