@@ -57,6 +57,7 @@ constexpr jlong kCapJpegDecode = 2;
 constexpr jlong kCapStats = 4;
 constexpr jlong kCapLumaFormats = 8;
 constexpr jlong kCapThreadAffinity = 16;
+constexpr jlong kCapJpegIdct = 32;
 
 constexpr int kStatsFieldCount = 16;
 
@@ -455,6 +456,10 @@ struct Capture {
   bool strictMlPts = false;
   DecodePolicy decodePolicy = DecodePolicy::Newest;
   bool tolerateExtraneousJpegBytes = false;
+  // The inverse DCT of the JPEG decode. True: the accurate integer method (JDCT_ISLOW). False:
+  // the fast method (JDCT_IFAST), which is the default of the GStreamer jpegdec element. It is
+  // atomic because a test can change it while the worker decodes.
+  std::atomic<bool> jpegIdctAccurate {true};
   int strictMlMaxPulls = 4;
   int strictCpuMaxDrops = 2;
   int timingLogEvery = 0;
@@ -1317,9 +1322,12 @@ enum class JpegResult { Ok, Error, Damaged, Suspect };
 // Decodes one JPEG image into `out` (tight stride). When wantGray is true only the luma component
 // is decoded: libjpeg skips the inverse DCT, the upsampling and the color conversion of the
 // chroma components. The luma samples are the same samples that a full decode gives.
+// dctMethod selects the inverse DCT: JDCT_ISLOW is the accurate method, JDCT_IFAST is the method
+// of the GStreamer jpegdec element.
 JpegResult decodeJpeg(
     JpegDecoder* decoder, BufferPool* pool, const uint8_t* data, size_t size, bool wantGray,
-    PooledBuffer* out, int* outWidth, int* outHeight, int* outChannels, int rowPercent = 100) {
+    J_DCT_METHOD dctMethod, PooledBuffer* out, int* outWidth, int* outHeight, int* outChannels,
+    int rowPercent = 100) {
   // Volatile: these values change after setjmp() and are read after longjmp().
   PooledBuffer volatile buffer {};
   JSAMPROW rows[16];
@@ -1365,8 +1373,9 @@ JpegResult decodeJpeg(
 #endif
     channels = 3;
   }
-  // The accurate integer inverse DCT. It gives the reference pixel values.
-  cinfo->dct_method = JDCT_ISLOW;
+  // The caller selects the inverse DCT. JDCT_ISLOW gives the reference pixel values. JDCT_IFAST
+  // gives the same pixels as the jpegdec element of the old capture pipeline.
+  cinfo->dct_method = dctMethod;
   cinfo->do_fancy_upsampling = TRUE;
 
   jpeg_start_decompress(cinfo);
@@ -1450,9 +1459,12 @@ FrameHolder* frameFromJpegSample(Capture* capture, JpegDecoder* decoder, GstSamp
   int width = 0;
   int height = 0;
   int channels = 0;
+  // Read the method one time, so the test-only extra decode below uses the same method.
+  const J_DCT_METHOD dctMethod =
+      capture->jpegIdctAccurate.load(std::memory_order_relaxed) ? JDCT_ISLOW : JDCT_IFAST;
   const JpegResult result = decodeJpeg(
       decoder, capture->pool.get(), map.data, map.size, capture->outputMode == kOutputGray,
-      &pixels, &width, &height, &channels);
+      dctMethod, &pixels, &width, &height, &channels);
   // Copy the warning fields now. The test-only extra decode below resets them.
   const bool prematureEof = decoder->error.prematureEof;
   const unsigned extraneousBytesTotal = decoder->error.extraneousBytesTotal;
@@ -1467,7 +1479,7 @@ FrameHolder* frameFromJpegSample(Capture* capture, JpegDecoder* decoder, GstSamp
     int c = 0;
     if (decodeJpeg(
             decoder, capture->pool.get(), map.data, map.size, capture->outputMode == kOutputGray,
-            &scratch, &w, &h, &c, std::min(100, extra)) != JpegResult::Error) {
+            dctMethod, &scratch, &w, &h, &c, std::min(100, extra)) != JpegResult::Error) {
       capture->pool->release(scratch);
     }
   }
@@ -1743,6 +1755,9 @@ jlong createCapture(const std::string& pipelineText, int outputMode) {
   }
   capture->tolerateExtraneousJpegBytes =
       envFlagEnabled("PV_GSTREAMER_CAPTURE_ALLOW_JPEG_EXTRA_BYTES");
+  // PV_GSTREAMER_CAPTURE_JPEG_IDCT: "fast" gives the pixels of the jpegdec element (the old
+  // pipeline). Each other value keeps the accurate method, which is nearer to the camera picture.
+  capture->jpegIdctAccurate.store(envLower("PV_GSTREAMER_CAPTURE_JPEG_IDCT") != "fast");
   capture->captureTimeCaps = gst_caps_new_empty_simple("timestamp/x-photonvision-capture-mono");
 
   GstElement* mlSinkElement = gst_bin_get_by_name(GST_BIN(pipeline), "pvmlsink");
@@ -1820,9 +1835,19 @@ extern "C" JNIEXPORT jlong JNICALL
 Java_org_photonvision_gstreamer_GStreamerCaptureJNI_getCapabilities(JNIEnv*, jclass) {
   jlong capabilities = kCapOptions | kCapStats | kCapLumaFormats | kCapThreadAffinity;
 #ifdef PV_HAVE_LIBJPEG
-  capabilities |= kCapJpegDecode;
+  capabilities |= kCapJpegDecode | kCapJpegIdct;
 #endif
   return capabilities;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_photonvision_gstreamer_GStreamerCaptureJNI_setJpegIdctAccurate(
+    JNIEnv*, jclass, jlong capturePtr, jboolean accurate) {
+  Capture* capture = fromHandle<Capture>(capturePtr);
+  if (capture == nullptr) {
+    return;
+  }
+  capture->jpegIdctAccurate.store(accurate == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL

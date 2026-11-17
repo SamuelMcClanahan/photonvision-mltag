@@ -115,6 +115,21 @@ public final class GStreamerCapture implements AutoCloseable {
         return Stats.fromNative(GStreamerCaptureJNI.getStats(nativePtr));
     }
 
+    /**
+     * Selects the inverse DCT of the JPEG decode for this capture. Call it before the first grab, so
+     * that each frame uses the same method. The default comes from PV_GSTREAMER_CAPTURE_JPEG_IDCT.
+     *
+     * @param accurate True for the accurate method, false for the method of the jpegdec element.
+     * @return False if the library cannot select the method.
+     */
+    public boolean setJpegIdctAccurate(boolean accurate) {
+        if (nativePtr == 0 || !GStreamerCaptureJNI.hasCapability(GStreamerCaptureJNI.CAP_JPEG_IDCT)) {
+            return false;
+        }
+        GStreamerCaptureJNI.setJpegIdctAccurate(nativePtr, accurate);
+        return true;
+    }
+
     @Override
     public void close() {
         if (nativePtr != 0) {

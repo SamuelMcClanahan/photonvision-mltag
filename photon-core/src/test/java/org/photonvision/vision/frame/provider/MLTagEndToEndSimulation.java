@@ -290,6 +290,12 @@ public class MLTagEndToEndSimulation {
     /** Number of frames that the simulated model could not identify. It must stay 0. */
     private static final AtomicInteger unknownFrames = new AtomicInteger();
 
+    /**
+     * The model input path of the last simulated detect call. The report prints it, so an FPS
+     * estimate says if it used the monochrome fast path or the slower base operation.
+     */
+    private static volatile String modelInputPath = "none";
+
     // The index of a frame is in the top left corner of the picture: 12 blocks of 16x16 pixels
     // (black = 0, white = 1) and below them the inverse blocks. No region is near these blocks.
     private static final int INDEX_BITS = 12;
@@ -1236,9 +1242,7 @@ public class MLTagEndToEndSimulation {
         public ObjectDetector load() {
             Model model = this;
             return new ObjectDetector() {
-                private final Mat resizedScratch = new Mat();
-                private final Mat letterboxed = new Mat();
-                private final Mat letterboxedBgr = new Mat();
+                private final Letterbox.ModelInputScratch scratch = new Letterbox.ModelInputScratch();
                 private final Mat rgb = new Mat();
                 private volatile long busySink = 0;
                 private double extraPrepare = 0;
@@ -1272,20 +1276,20 @@ public class MLTagEndToEndSimulation {
                     }
                     for (int i = 0; i < prepareCount; i++) {
                         // The same input preparation as RubikObjectDetector and RknnObjectDetector.
-                        Letterbox.letterbox(
-                                in,
-                                resizedScratch,
-                                letterboxed,
-                                new Size(640, 640),
-                                ColorHelper.colorToScalar(Color.GRAY));
-                        Mat modelInput = letterboxed;
-                        if (letterboxed.channels() == 1) {
-                            Imgproc.cvtColor(letterboxed, letterboxedBgr, Imgproc.COLOR_GRAY2BGR);
-                            modelInput = letterboxedBgr;
-                        }
+                        // PV_MLTAG_MONO_MODEL_INPUT=exact gives the time of a board where the
+                        // self-check fails and the 3-channel base operation runs.
+                        Letterbox.ModelInput input =
+                                Letterbox.prepareModelInput(
+                                        in, scratch, new Size(640, 640), ColorHelper.colorToScalar(Color.GRAY));
                         // The JNI libraries convert BGR to RGB.
-                        Imgproc.cvtColor(modelInput, rgb, Imgproc.COLOR_BGR2RGB);
+                        Imgproc.cvtColor(input.image(), rgb, Imgproc.COLOR_BGR2RGB);
                     }
+                    modelInputPath =
+                            in.channels() != 1
+                                    ? "color"
+                                    : scratch.lastWasMonochromeFastPath()
+                                            ? "monochrome fast path"
+                                            : "monochrome base operation";
 
                     try {
                         npu.cores.acquire();
@@ -1331,9 +1335,7 @@ public class MLTagEndToEndSimulation {
 
                 @Override
                 public void release() {
-                    resizedScratch.release();
-                    letterboxed.release();
-                    letterboxedBgr.release();
+                    scratch.release();
                     rgb.release();
                 }
             };
@@ -1890,7 +1892,7 @@ public class MLTagEndToEndSimulation {
         line(
                 "%-11s cameras=%d cpuSlowdown=%.1f%s npuMs=%.1f | cameraFps=%.1f resultFps=%s"
                         + "p99FrameFps=%sp99ReportedFps=%sworstSecondFps=%s| latencyMs p50=%.1f p95=%.1f max=%.1f | decodeMs=%.1f getMs=%.1f runMs=%.1f"
-                        + " pipesMs=%.1f | equalToReference=%.2f%% | cpuCoresBusy=%.2f",
+                        + " pipesMs=%.1f | equalToReference=%.2f%% | cpuCoresBusy=%.2f | modelInput=%s",
                 board.name(),
                 cameras,
                 slowdown,
@@ -1909,7 +1911,8 @@ public class MLTagEndToEndSimulation {
                 o.runMillis(),
                 o.pipeMillis(),
                 o.equalToReferenceFraction() * 100.0,
-                o.cpuCores());
+                o.cpuCores(),
+                modelInputPath);
     }
 
     private static double[] slowdowns() {

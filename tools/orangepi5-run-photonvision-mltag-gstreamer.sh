@@ -70,6 +70,12 @@ export PV_USB_GSTREAMER_CPU_FORMAT="${PV_USB_GSTREAMER_CPU_FORMAT:-GRAY8}"
 # direct: direct capture only.   legacy: jpegdec + videoconvert in GStreamer only.
 export PV_USB_GSTREAMER_CAPTURE_MODE="${PV_USB_GSTREAMER_CAPTURE_MODE:-auto}"
 
+# JPEG decode method of the direct capture.
+# accurate: the exact integer method. The picture is nearer to the camera picture.
+# fast:     the method of GStreamer jpegdec. The gray pixels of a monochrome camera
+#           are then equal to the legacy pipeline.
+export PV_GSTREAMER_CAPTURE_JPEG_IDCT="${PV_GSTREAMER_CAPTURE_JPEG_IDCT:-accurate}"
+
 # Optional hardware JPEG decoder element. It is used first if the board has it.
 # With the Rockchip GStreamer plugins: PV_USB_GSTREAMER_HW_JPEG_DECODER=mppjpegdec
 # Find candidates with: tools/gst-probe-hw-jpeg.sh

@@ -300,23 +300,46 @@ public class MLTagStageBenchmark {
                                 return null;
                             });
 
-            // Now: Mats are kept, 1-channel resize, gray to BGR, then BGR to RGB in the JNI.
-            Mat scratch = new Mat();
-            Mat letterboxed = new Mat();
-            Mat expanded = new Mat();
+            // Now: the shared model input helper of the detectors, then BGR to RGB in the JNI.
+            // The helper uses the 1-channel fast path only if the self-check proved it on this
+            // OpenCV build.
+            Letterbox.ModelInputScratch scratch = new Letterbox.ModelInputScratch();
             double current =
                     medianMillis(
                             20,
                             200,
                             () -> {
-                                Letterbox.letterbox(gray, scratch, letterboxed, modelSize, pad);
-                                Imgproc.cvtColor(letterboxed, expanded, Imgproc.COLOR_GRAY2BGR);
-                                Imgproc.cvtColor(expanded, rgb, Imgproc.COLOR_BGR2RGB);
+                                Letterbox.ModelInput input =
+                                        Letterbox.prepareModelInput(gray, scratch, modelSize, pad);
+                                Imgproc.cvtColor(input.image(), rgb, Imgproc.COLOR_BGR2RGB);
+                                return null;
+                            });
+            String activePath =
+                    scratch.lastWasMonochromeFastPath() ? "fast path" : "base operation";
+
+            // The time on a board where the self-check fails (or PV_MLTAG_MONO_MODEL_INPUT=exact):
+            // copy to three channels, then the 3-channel letterbox of the helper.
+            Mat grayAsBgr = new Mat();
+            double exact =
+                    medianMillis(
+                            20,
+                            200,
+                            () -> {
+                                Imgproc.cvtColor(gray, grayAsBgr, Imgproc.COLOR_GRAY2BGR);
+                                Letterbox.ModelInput input =
+                                        Letterbox.prepareModelInput(grayAsBgr, scratch, modelSize, pad);
+                                Imgproc.cvtColor(input.image(), rgb, Imgproc.COLOR_BGR2RGB);
                                 return null;
                             });
             line(
-                    "model input %dx%d: previous(BGR)=%.3f ms new(gray)=%.3f ms",
-                    size[0], size[1], previous, current);
+                    "model input %dx%d: previous(BGR)=%.3f ms new(gray, %s)=%.3f ms"
+                            + " new(gray, base operation)=%.3f ms",
+                    size[0], size[1], previous, activePath, current, exact);
+            scratch.release();
+            grayAsBgr.release();
+            bgr.release();
+            gray.release();
+            rgb.release();
         }
     }
 

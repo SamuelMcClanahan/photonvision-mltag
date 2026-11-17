@@ -304,6 +304,137 @@ public class GStreamerCaptureTest {
         assertTrue(largestDifference <= 6, "Unexpected difference: " + largestDifference);
     }
 
+    /** The JPEG of a monochrome UVC camera: YCbCr 4:2:2 with neutral chroma, 1600x1304, q 90. */
+    private static Path writeMonochrome422Jpeg(String name) {
+        Mat original = makeTestImage(1600, 1304, false);
+        Mat monochromeBgr = new Mat();
+        Imgproc.cvtColor(original, monochromeBgr, Imgproc.COLOR_GRAY2BGR);
+        Path file =
+                writeJpeg(
+                        name,
+                        monochromeBgr,
+                        Imgcodecs.IMWRITE_JPEG_QUALITY,
+                        90,
+                        Imgcodecs.IMWRITE_JPEG_SAMPLING_FACTOR,
+                        Imgcodecs.IMWRITE_JPEG_SAMPLING_FACTOR_422);
+        original.release();
+        monochromeBgr.release();
+        return file;
+    }
+
+    /**
+     * Decodes the file with the direct capture into a gray image. The method is selected before the
+     * first grab, so the first frame (decoded in grab) and the worker frames use it.
+     */
+    private static Mat directGray(Path file, boolean accurate, int frames) {
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(jpegFilePipeline(file), GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            assertTrue(capture.setJpegIdctAccurate(accurate));
+            Mat first = grabCopy(capture, 1);
+            // The next frames come from the worker. They must be equal to the first frame.
+            for (int i = 1; i < frames; i++) {
+                Mat next = grabCopy(capture, 1);
+                assertSamePixels(first, next, "worker frame " + i + ", accurate=" + accurate);
+                next.release();
+            }
+            return first;
+        }
+    }
+
+    /** Grabs one frame of the old capture pipeline (jpegdec and videoconvert to the given format). */
+    private static Mat legacyFrame(Path file, String format, int channels) {
+        String pipeline =
+                "multifilesrc location=\""
+                        + file
+                        + "\" loop=true caps=image/jpeg,framerate=30/1 ! jpegparse ! jpegdec ! videoconvert"
+                        + " ! video/x-raw,format="
+                        + format
+                        + " ! "
+                        + APPSINK;
+        try (GStreamerCapture capture = GStreamerCapture.open(pipeline)) {
+            assertNotNull(capture);
+            return grabCopy(capture, channels);
+        }
+    }
+
+    private static void assumeFastIdct() {
+        assumeCapability(GStreamerCaptureJNI.CAP_JPEG_IDCT);
+        assumeElement("multifilesrc");
+        assumeElement("jpegparse");
+        assumeElement("jpegdec");
+        assumeElement("videoconvert");
+    }
+
+    /**
+     * Fast mode isolates the inverse DCT: the old pipeline with GRAY8 output takes the luma plane of
+     * jpegdec. The direct gray image must be pixel-exact.
+     */
+    @Test
+    public void fastIdctGrayEqualsLegacyGray8Pipeline() {
+        assumeFastIdct();
+        Path file = writeMonochrome422Jpeg("mono422-fast-gray8.jpg");
+        Mat direct = directGray(file, false, 3);
+        Mat legacy = legacyFrame(file, "GRAY8", 1);
+        assertSamePixels(legacy, direct, "fast IDCT against jpegdec GRAY8");
+        direct.release();
+        legacy.release();
+    }
+
+    /**
+     * Fast mode against the exact old path: jpegdec, videoconvert to BGR, then BGR to gray for the
+     * tag detector. The direct gray image must be pixel-exact.
+     */
+    @Test
+    public void fastIdctGrayEqualsLegacyBgrPipeline() {
+        assumeFastIdct();
+        Path file = writeMonochrome422Jpeg("mono422-fast-bgr.jpg");
+        Mat direct = directGray(file, false, 3);
+        Mat legacyBgr = legacyFrame(file, "BGR", 3);
+        Mat legacy = new Mat();
+        Imgproc.cvtColor(legacyBgr, legacy, Imgproc.COLOR_BGR2GRAY);
+        assertSamePixels(legacy, direct, "fast IDCT against jpegdec BGR and BGR2GRAY");
+        direct.release();
+        legacyBgr.release();
+        legacy.release();
+    }
+
+    /** Accurate mode is the default. It must not be changed by a capture in fast mode. */
+    @Test
+    public void accurateIdctIsTheDefaultAndDiffersFromFast() {
+        assumeFastIdct();
+        Path file = writeMonochrome422Jpeg("mono422-modes.jpg");
+        Mat reference = Imgcodecs.imread(file.toString(), Imgcodecs.IMREAD_GRAYSCALE);
+
+        Mat defaultImage;
+        try (GStreamerCapture capture =
+                GStreamerCapture.open(jpegFilePipeline(file), GStreamerCaptureJNI.OUTPUT_GRAY)) {
+            assertNotNull(capture);
+            defaultImage = grabCopy(capture, 1);
+        }
+        Mat fast = directGray(file, false, 1);
+        Mat accurate = directGray(file, true, 3);
+        assertSamePixels(reference, defaultImage, "default mode against imread");
+        assertSamePixels(reference, accurate, "accurate mode against imread");
+
+        Mat difference = new Mat();
+        Core.absdiff(accurate, fast, difference);
+        double largestDifference = Core.minMaxLoc(difference).maxVal;
+        int differentPixels = Core.countNonZero(difference);
+        System.out.println(
+                "[capture] accurate against fast IDCT: mean squared difference="
+                        + meanSquaredError(accurate, fast)
+                        + ", largest difference="
+                        + largestDifference
+                        + ", different pixels="
+                        + differentPixels);
+        difference.release();
+        reference.release();
+        defaultImage.release();
+        fast.release();
+        accurate.release();
+    }
+
     /** Removes the Huffman table segments. Many UVC cameras send Motion-JPEG without them. */
     private static byte[] stripHuffmanTables(byte[] jpeg) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();

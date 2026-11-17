@@ -48,6 +48,12 @@ public final class GStreamerCaptureJNI {
     /** {@link #setCurrentThreadCpuMask(long)} is available. */
     public static final long CAP_THREAD_AFFINITY = 16;
 
+    /**
+     * {@link #setJpegIdctAccurate(long, boolean)} is available. The JPEG decode can use the accurate
+     * or the fast inverse DCT.
+     */
+    public static final long CAP_JPEG_IDCT = 32;
+
     private static final Logger logger = new Logger(GStreamerCaptureJNI.class, LogGroup.Camera);
 
     // Set by load(). It must come before the fields that call load().
@@ -170,6 +176,14 @@ public final class GStreamerCaptureJNI {
      * </ol>
      */
     public static native long[] getStats(long capturePtr);
+
+    /**
+     * Selects the inverse DCT of the JPEG decode for one capture. True: the accurate integer method
+     * (the default, nearer to the camera picture). False: the fast method of the GStreamer jpegdec
+     * element, which gives the pixels of the old capture pipeline. Only available with {@link
+     * #CAP_JPEG_IDCT}.
+     */
+    public static native void setJpegIdctAccurate(long capturePtr, boolean accurate);
 
     public static native void destroy(long capturePtr);
 
