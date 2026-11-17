@@ -52,7 +52,8 @@ import org.wpilib.vision.apriltag.AprilTagDetection;
  */
 public class AprilTagMLHybridPipe
         extends CVPipe<Frame, MLDetectionResult, AprilTagMLHybridPipe.Params> implements Releasable {
-    private static final Logger logger = new Logger(AprilTagMLHybridPipe.class, LogGroup.VisionModule);
+    private static final Logger logger =
+            new Logger(AprilTagMLHybridPipe.class, LogGroup.VisionModule);
 
     /**
      * Number of frames that can be in model inference at the same time. Each lane has its own copy of
@@ -108,8 +109,8 @@ public class AprilTagMLHybridPipe
 
         /**
          * Waits until the lane does not use the frame. After this the frame can be released. An
-         * interrupt does not stop the wait, because a frame that is released during the inference
-         * gives wrong pixels or a native crash. The interrupt flag is set again after the wait.
+         * interrupt does not stop the wait, because a frame that is released during the inference gives
+         * wrong pixels or a native crash. The interrupt flag is set again after the wait.
          */
         public void await() {
             boolean interrupted = false;

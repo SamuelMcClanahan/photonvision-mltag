@@ -87,8 +87,7 @@ public class AprilTagPipelineInferenceLanesTest {
         AprilTagDetector detector = new AprilTagDetector();
         detector.addFamily(AprilTagFamily.kTag36h11.getNativeName());
         // Use the quad settings of the AprilTag pipeline.
-        var decodeDefaults =
-                new AprilTagROIDecodePipe.ROIDecodeParams();
+        var decodeDefaults = new AprilTagROIDecodePipe.ROIDecodeParams();
         detector.setConfig(decodeDefaults.detectorConfig);
         detector.setQuadThresholdParameters(decodeDefaults.quadParams);
         tagBoxes = new ArrayList<>();
@@ -644,8 +643,7 @@ public class AprilTagPipelineInferenceLanesTest {
                                                                 loaded.type,
                                                                 MathUtils.wpiNanoTime(),
                                                                 loaded.frameStaticProperties);
-                                                CVPipelineResult result =
-                                                        pipeline.run(frame, QuirkyCamera.DefaultCamera);
+                                                CVPipelineResult result = pipeline.run(frame, QuirkyCamera.DefaultCamera);
                                                 if (result == null) {
                                                     overlap.countDown();
                                                 } else {
@@ -706,8 +704,7 @@ public class AprilTagPipelineInferenceLanesTest {
         var pipe = newHybridPipe(model);
         var provider = new FileFrameProvider(imagePath, TestUtils.WPI2020Image.FOV, 1000, null);
         List<Frame> frames = new ArrayList<>();
-        List<AprilTagMLHybridPipe.PendingDetection> pendings =
-                new ArrayList<>();
+        List<AprilTagMLHybridPipe.PendingDetection> pendings = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             Frame frame = provider.get();
             frames.add(frame);

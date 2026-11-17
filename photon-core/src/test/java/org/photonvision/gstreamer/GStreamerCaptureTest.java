@@ -519,8 +519,7 @@ public class GStreamerCaptureTest {
             assertTrue(countA > 0, "The clean picture must be delivered");
             assertTrue(countB > 0, "The padded picture must be delivered");
             GStreamerCapture.Stats stats = capture.getStats();
-            assertTrue(
-                    stats.corruptFrames() <= 40, "Too many frames dropped: " + stats.corruptFrames());
+            assertTrue(stats.corruptFrames() <= 40, "Too many frames dropped: " + stats.corruptFrames());
         }
     }
 
@@ -591,7 +590,10 @@ public class GStreamerCaptureTest {
             return false;
         }
         value = value.trim().toLowerCase();
-        return !value.equals("0") && !value.equals("false") && !value.equals("no") && !value.equals("off");
+        return !value.equals("0")
+                && !value.equals("false")
+                && !value.equals("no")
+                && !value.equals("off");
     }
 
     @Test
@@ -599,8 +601,7 @@ public class GStreamerCaptureTest {
         assumeCapability(GStreamerCaptureJNI.CAP_LUMA_FORMATS | GStreamerCaptureJNI.CAP_STATS);
         assumeElement("videotestsrc");
 
-        String pipeline =
-                "videotestsrc ! video/x-raw,format=NV12,width=326,height=242 ! " + APPSINK;
+        String pipeline = "videotestsrc ! video/x-raw,format=NV12,width=326,height=242 ! " + APPSINK;
         try (GStreamerCapture capture =
                 GStreamerCapture.open(pipeline, GStreamerCaptureJNI.OUTPUT_GRAY)) {
             assertNotNull(capture);

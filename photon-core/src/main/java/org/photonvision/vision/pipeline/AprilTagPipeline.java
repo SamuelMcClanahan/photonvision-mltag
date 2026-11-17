@@ -687,9 +687,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
      * @return The sum of the calculation time of all tags, in nanoseconds.
      */
     private long estimateSingleTagPoses(
-            List<AprilTagDetection> detections,
-            boolean[] needsPose,
-            AprilTagPoseEstimate[] poses) {
+            List<AprilTagDetection> detections, boolean[] needsPose, AprilTagPoseEstimate[] poses) {
         List<Integer> selected = new ArrayList<>(detections.size());
         for (int i = 0; i < detections.size(); i++) {
             if (needsPose[i]) {
