@@ -137,18 +137,28 @@ import org.wpilib.vision.apriltag.AprilTagDetector;
  * thread wake-up times of the operating system have their real size, so it is the better mode for
  * the variation of the frame times (p99).
  *
- * <p>PV_MLTAG_SIM_SLOWDOWNS is a list of values for k (default 1.3,1.5,2.0). The single-thread
- * 7-Zip benchmark gives a ratio of 1.1 to 1.3 between a Cortex-A76 core of the RK3588 and a core of
- * the computer where this simulation was made, so 1.3 is the expected value, and 1.5 and 2.0 are
- * values with a reserve. Measure the ratio again on a different computer.
+ * <p>PV_MLTAG_SIM_SLOWDOWNS is a list of values for k (default 1.3,1.5,2.0). The correct values
+ * depend on the computer that runs the simulation. Measure them before each set of runs, because a
+ * cloud computer can change between two sessions:
  *
- * <p>The JPEG decode is slower on the RK3588 than this general ratio. The benchmark pts/tjbench of
- * the Phoronix Test Suite (libjpeg-turbo, picture jpeg-test-1.JPG, 4:2:2 to BGR) gives 156
- * megapixels per second on the computer where this simulation was made. It gives 97.4 megapixels
- * per second on the Cortex-A76 of the RK3588 (openbenchmarking.org result for a Mixtile Blade 3).
- * So the JPEG decode is 1.6 times slower on the RK3588. PV_MLTAG_SIM_JPEG_FACTOR sets this factor
- * for the JPEG decode in the work mode with the mjpeg format. Without it, the JPEG decode uses the
- * value of k. The time scaling mode does not use it, because there all work has the same factor k.
+ * <ul>
+ *   <li>General factor k: run "7z b -mmt1" and read the total rating in MIPS. Public sbc-bench
+ *       results for one Cortex-A76 core of the RK3588 are 2689 MIPS (Orange Pi 5) to 3146 MIPS
+ *       (Rock 5B). k = rating of this computer / rating of the board.
+ *   <li>JPEG factor: run "tjbench jpeg-test-1.JPG -benchtime 20 -warmup 5 -nowrite" with the
+ *       picture of the Phoronix Test Suite benchmark pts/tjbench (4:2:2 to BGR) and read the
+ *       decompression throughput. The public result for the Cortex-A76 of the RK3588 is 97.4
+ *       megapixels per second (openbenchmarking.org, Mixtile Blade 3). JPEG factor = throughput of
+ *       this computer / 97.4. Give it with PV_MLTAG_SIM_JPEG_FACTOR. It is used for the JPEG decode
+ *       in the work mode with the mjpeg format. Without it, the JPEG decode uses the value of k.
+ *       The time scaling mode does not use it, because there all work has the same factor.
+ * </ul>
+ *
+ * <p>Two computers were used for the results of this work. First computer: 3260 to 3540 MIPS and
+ * 156 megapixels per second, so k = 1.1 to 1.3 and JPEG factor 1.6; the runs used k = 1.3, 1.5 and
+ * 2.0. Second computer: 4080 to 4810 MIPS and 201 to 209 megapixels per second, so k = 1.3 to 1.8
+ * and JPEG factor 2.1; the runs used k = 1.7, 2.0 and 2.6. The JPEG decode is slower on the RK3588
+ * than the general factor shows.
  *
  * <p>The run scripts set PV_OPENCV_THREADS=1 and PV_GSTREAMER_CAPTURE_RT_PRIORITY=10. Use the same
  * settings for the simulation. The real-time priority needs root or CAP_SYS_NICE. If the kernel
